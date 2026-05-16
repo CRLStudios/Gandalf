@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import signal
 
 import discord
 from discord import app_commands
@@ -7,6 +9,10 @@ from discord.ext import commands
 from config import BOT_TOKEN, SCRIPTS_DIR, WORKSPACES_DIR
 from utils.permissions import get_allowed_guilds
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 intents = discord.Intents.default()
@@ -18,11 +24,13 @@ async def setup_hook():
     await bot.load_extension("cogs.scripts")
     await bot.load_extension("cogs.scheduler")
     await bot.load_extension("cogs.shortcuts")
-    await bot.tree.sync()
+    await bot.load_extension("cogs.env")
+    await bot.load_extension("cogs.repos")
 
 
 @bot.event
 async def on_ready():
+    logger.info("Bot ready: %s (ID %s)", bot.user, bot.user.id)
     allowed = get_allowed_guilds()
     if not allowed:
         for guild in bot.guilds:
@@ -30,6 +38,8 @@ async def on_ready():
             guild_dir.mkdir(parents=True, exist_ok=True)
             (guild_dir / f"{guild.name}.txt").touch()
             (WORKSPACES_DIR / str(guild.id)).mkdir(parents=True, exist_ok=True)
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
         return
     for guild in bot.guilds:
         if guild.id not in allowed:
@@ -40,6 +50,8 @@ async def on_ready():
             guild_dir.mkdir(parents=True, exist_ok=True)
             (guild_dir / f"{guild.name}.txt").touch()
             (WORKSPACES_DIR / str(guild.id)).mkdir(parents=True, exist_ok=True)
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
 
 
 @bot.event
@@ -53,6 +65,8 @@ async def on_guild_join(guild: discord.Guild):
     guild_dir.mkdir(parents=True, exist_ok=True)
     (guild_dir / f"{guild.name}.txt").touch()
     (WORKSPACES_DIR / str(guild.id)).mkdir(parents=True, exist_ok=True)
+    bot.tree.copy_global_to(guild=guild)
+    await bot.tree.sync(guild=guild)
 
 
 @bot.tree.error
@@ -68,5 +82,22 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await interaction.response.send_message(msg, ephemeral=True)
 
 
+async def main():
+    async with bot:
+        await bot.start(BOT_TOKEN)
+
+
 if __name__ == "__main__":
-    bot.run(BOT_TOKEN)
+    loop = asyncio.new_event_loop()
+
+    def _shutdown():
+        logger.info("Shutdown signal received, calling bot.close()")
+        loop.create_task(bot.close())
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _shutdown)
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()

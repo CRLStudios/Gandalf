@@ -6,3 +6,4 @@ bot.pid
 bot.log
 venv/
 workspaces/
+envs/

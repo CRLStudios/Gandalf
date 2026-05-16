@@ -3,6 +3,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import WORKSPACES_DIR
+from utils.guild_env import load_guild_env
 from utils.runner import run_script, resolve_script, list_scripts
 from utils.permissions import require_permissions
 
@@ -35,7 +36,8 @@ class ScriptsCog(commands.Cog):
         arg_list = args.split() if args else []
         workspace = WORKSPACES_DIR / str(interaction.guild_id)
         workspace.mkdir(parents=True, exist_ok=True)
-        returncode, stdout, stderr = await run_script(path, arg_list, cwd=workspace)
+        guild_env = load_guild_env(interaction.guild_id)
+        returncode, stdout, stderr = await run_script(path, arg_list, cwd=workspace, env=guild_env)
 
         embed = self._build_embed(script, returncode, stdout, stderr)
         await interaction.followup.send(embed=embed)

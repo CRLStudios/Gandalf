@@ -3,7 +3,7 @@
   "allowed_guilds": [988122446383153193],
   "commands": {
     "hello": {
-      "roles": [],
+      "roles": ["Gandalf User"],
       "channels": ["bot"]
     },
     "run": {
@@ -28,7 +28,7 @@
     }
   },
   "default": {
-    "roles": [],
+    "roles": ["Gandalf User"],
     "channels": []
   }
 }

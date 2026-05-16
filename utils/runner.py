@@ -1,16 +1,19 @@
 import asyncio
+import os
 from pathlib import Path
 
 from config import SCRIPTS_DIR, SCRIPT_TIMEOUT
 
 
-async def run_script(path: Path, args: list[str], timeout: int = SCRIPT_TIMEOUT, cwd: Path | None = None) -> tuple[int, str, str]:
+async def run_script(path: Path, args: list[str], timeout: int = SCRIPT_TIMEOUT, cwd: Path | None = None, env: dict[str, str] | None = None) -> tuple[int, str, str]:
     """Run a script via /bin/bash and return (returncode, stdout, stderr)."""
+    proc_env = {**os.environ, **env} if env else None
     proc = await asyncio.create_subprocess_exec(
         "/bin/bash", str(path), *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
+        env=proc_env,
     )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
