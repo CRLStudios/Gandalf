@@ -5,3 +5,4 @@ schedules/*.json
 bot.pid
 bot.log
 venv/
+workspaces/

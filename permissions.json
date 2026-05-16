@@ -1,7 +1,11 @@
 {
-  "admin_user_id": "",
-  "allowed_guilds": [],
+  "admin_user_id": "1197208967160545456",
+  "allowed_guilds": [988122446383153193],
   "commands": {
+    "hello": {
+      "roles": [],
+      "channels": ["bot"]
+    },
     "run": {
       "roles": [],
       "channels": []
