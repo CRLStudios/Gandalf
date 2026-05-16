@@ -90,9 +90,13 @@ async def main():
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
 
+    async def _close():
+        await bot.close()
+        logger.info("bot.close() completed")
+
     def _shutdown():
         logger.info("Shutdown signal received, calling bot.close()")
-        loop.create_task(bot.close())
+        loop.create_task(_close())
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _shutdown)
