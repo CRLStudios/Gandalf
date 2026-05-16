@@ -1,0 +1,30 @@
+{
+  "admin_user_id": "",
+  "allowed_guilds": [],
+  "commands": {
+    "run": {
+      "roles": [],
+      "channels": []
+    },
+    "list": {
+      "roles": [],
+      "channels": []
+    },
+    "schedule add": {
+      "roles": [],
+      "channels": []
+    },
+    "schedule remove": {
+      "roles": [],
+      "channels": []
+    },
+    "schedule list": {
+      "roles": [],
+      "channels": []
+    }
+  },
+  "default": {
+    "roles": [],
+    "channels": []
+  }
+}

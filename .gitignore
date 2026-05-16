@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+schedules/*.json
+bot.pid
+bot.log
+venv/

@@ -1,0 +1,3 @@
+{
+  "hello": {"script": "hello.sh", "description": "Test greeting"}
+}
