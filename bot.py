@@ -26,6 +26,7 @@ async def setup_hook():
     await bot.load_extension("cogs.shortcuts")
     await bot.load_extension("cogs.env")
     await bot.load_extension("cogs.repos")
+    await bot.tree.sync()
 
 
 @bot.event
@@ -38,7 +39,7 @@ async def on_ready():
             guild_dir.mkdir(parents=True, exist_ok=True)
             (guild_dir / f"{guild.name}.txt").touch()
             (WORKSPACES_DIR / str(guild.id)).mkdir(parents=True, exist_ok=True)
-            bot.tree.copy_global_to(guild=guild)
+            #bot.tree.copy_global_to(guild=guild)
             await bot.tree.sync(guild=guild)
         return
     for guild in bot.guilds:
@@ -50,7 +51,7 @@ async def on_ready():
             guild_dir.mkdir(parents=True, exist_ok=True)
             (guild_dir / f"{guild.name}.txt").touch()
             (WORKSPACES_DIR / str(guild.id)).mkdir(parents=True, exist_ok=True)
-            bot.tree.copy_global_to(guild=guild)
+            #bot.tree.copy_global_to(guild=guild)
             await bot.tree.sync(guild=guild)
 
 
