@@ -8,7 +8,21 @@ DEFAULT_CONFIG = {
     "dev_branch": None,    # the shared development branch
     "branches": [],        # user branches merged into dev_branch
     "ping_user_id": None,  # who gets pinged on conflict (falls back to admin_user_id)
+    "schedule": None,      # {"time": "HH:MM", "channel_id": int} for daily auto-merge
 }
+
+
+def all_guild_ids() -> list[int]:
+    """Guild IDs that have a saved merge config."""
+    if not MERGECONFIGS_DIR.is_dir():
+        return []
+    ids = []
+    for path in MERGECONFIGS_DIR.glob("*.json"):
+        try:
+            ids.append(int(path.stem))
+        except ValueError:
+            continue
+    return ids
 
 
 def _config_path(guild_id: int) -> Path:

@@ -3,11 +3,13 @@ import re
 import time
 
 import discord
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from discord import app_commands
 from discord.ext import commands
 
 from utils.gitops import build_git_env, git
-from utils.merge_config import load_merge_config, save_merge_config
+from utils.merge_config import all_guild_ids, load_merge_config, save_merge_config
 from utils.merge_engine import BranchResult, MergeEngine, MergeReport
 from utils.permissions import check_permissions, get_admin_user_id, require_permissions
 from utils.repos import repo_credentials, repo_names, repo_workspace
@@ -15,6 +17,7 @@ from utils.repos import repo_credentials, repo_names, repo_workspace
 logger = logging.getLogger(__name__)
 
 BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+TIME_PATTERN = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 EMBED_DESC_LIMIT = 4096
 
@@ -43,6 +46,76 @@ class MergeCog(commands.Cog):
         # is race-free on the event loop, unlike check-then-acquire on a Lock
         # (which would silently queue a second run instead of rejecting it).
         self._running: set[int] = set()
+        self.scheduler = AsyncIOScheduler()
+
+    async def cog_load(self):
+        for guild_id in all_guild_ids():
+            schedule = load_merge_config(guild_id).get("schedule")
+            if schedule:
+                try:
+                    self._register_schedule(guild_id, schedule)
+                except Exception:
+                    logger.exception("Could not register merge schedule for guild %s", guild_id)
+        self.scheduler.start()
+
+    async def cog_unload(self):
+        self.scheduler.shutdown(wait=False)
+
+    # --------------------------------------------------------------- scheduling
+
+    def _job_id(self, guild_id: int) -> str:
+        return f"merge_{guild_id}"
+
+    def _register_schedule(self, guild_id: int, schedule: dict):
+        hour, minute = (int(p) for p in schedule["time"].split(":"))
+        self.scheduler.add_job(
+            self._scheduled_merge,
+            CronTrigger(hour=hour, minute=minute),
+            id=self._job_id(guild_id),
+            args=[guild_id],
+            replace_existing=True,
+        )
+
+    def _unregister_schedule(self, guild_id: int):
+        if self.scheduler.get_job(self._job_id(guild_id)):
+            self.scheduler.remove_job(self._job_id(guild_id))
+
+    async def _scheduled_merge(self, guild_id: int):
+        config = load_merge_config(guild_id)
+        schedule = config.get("schedule")
+        if not schedule:
+            # Unscheduled after the job was registered — clean up defensively.
+            self._unregister_schedule(guild_id)
+            return
+
+        channel = self.bot.get_channel(schedule["channel_id"])
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(schedule["channel_id"])
+            except discord.HTTPException:
+                logger.warning(
+                    "Scheduled merge for guild %s: channel %s unavailable",
+                    guild_id, schedule["channel_id"],
+                )
+                return
+
+        if guild_id in self._running:
+            await channel.send("⏰ Scheduled merge skipped — a merge is already running.")
+            return
+        self._running.add(guild_id)
+        try:
+            error = self._config_error(guild_id, config)
+            if error:
+                await channel.send(f"⏰ Scheduled merge skipped: {error}")
+                return
+            repo = config["repo"] or repo_names(guild_id)[0]
+            logger.info("Scheduled merge starting for guild %s (repo %s)", guild_id, repo)
+            status_msg = await channel.send(f"⏰ Daily merge run started for `{repo}`…")
+            await self._execute(guild_id, config, repo, channel, status_msg)
+        except Exception:
+            logger.exception("Scheduled merge failed for guild %s", guild_id)
+        finally:
+            self._running.discard(guild_id)
 
     # ------------------------------------------------------------------ /merge
 
@@ -77,8 +150,6 @@ class MergeCog(commands.Cog):
             return
 
         repo = config["repo"] or repo_names(guild_id)[0]
-        url, token = repo_credentials(guild_id, repo)
-        engine = MergeEngine(repo_workspace(guild_id, repo), url, token)
 
         try:
             await interaction.response.send_message(f"🧙 Merge run started for `{repo}`…")
@@ -91,6 +162,20 @@ class MergeCog(commands.Cog):
             status_msg = await interaction.channel.send(
                 f"🧙 Merge run started for `{repo}`…"
             )
+
+        await self._execute(guild_id, config, repo, interaction.channel, status_msg)
+
+    async def _execute(
+        self,
+        guild_id: int,
+        config: dict,
+        repo: str,
+        channel: discord.abc.Messageable,
+        status_msg: discord.Message,
+    ):
+        """Shared merge body for slash-command and scheduled runs."""
+        url, token = repo_credentials(guild_id, repo)
+        engine = MergeEngine(repo_workspace(guild_id, repo), url, token)
         last_edit = 0.0
 
         async def progress(text: str):
@@ -107,11 +192,11 @@ class MergeCog(commands.Cog):
         report = await engine.run(config["dev_branch"], config["branches"], progress)
 
         content, embed = self._build_report_message(config, repo, report)
-        await self._deliver_report(interaction, status_msg, content, embed)
+        await self._deliver_report(channel, status_msg, content, embed)
 
     @staticmethod
     async def _deliver_report(
-        interaction: discord.Interaction,
+        channel: discord.abc.Messageable,
         status_msg: discord.Message,
         content: str,
         embed: discord.Embed,
@@ -121,7 +206,7 @@ class MergeCog(commands.Cog):
             # message. Send it BEFORE deleting the status message so a failed
             # send can never lose the conflict report.
             try:
-                await interaction.channel.send(
+                await channel.send(
                     content=content, embed=embed,
                     allowed_mentions=discord.AllowedMentions(users=True),
                 )
@@ -141,7 +226,7 @@ class MergeCog(commands.Cog):
                 await status_msg.edit(content=None, embed=embed)
             except discord.HTTPException:
                 try:
-                    await interaction.channel.send(embed=embed)
+                    await channel.send(embed=embed)
                 except discord.HTTPException:
                     logger.exception("Failed to deliver merge report")
 
@@ -221,6 +306,43 @@ class MergeCog(commands.Cog):
         save_merge_config(interaction.guild_id, config)
         await interaction.response.send_message(f"{user.mention} will be pinged on merge conflicts.", ephemeral=True)
 
+    @config_group.command(name="schedule", description="Run the merge automatically every day at a set time")
+    @app_commands.describe(
+        time="24-hour time in the bot host's timezone, e.g. 03:30",
+        channel="Channel to post the merge results in",
+    )
+    @require_permissions()
+    async def config_schedule(
+        self, interaction: discord.Interaction, time: str, channel: discord.TextChannel
+    ):
+        match = TIME_PATTERN.match(time.strip())
+        if not match:
+            await interaction.response.send_message(
+                "Time must be 24-hour `HH:MM`, e.g. `03:30` or `18:00`.", ephemeral=True
+            )
+            return
+        normalized = f"{int(match[1]):02d}:{int(match[2]):02d}"
+        config = load_merge_config(interaction.guild_id)
+        config["schedule"] = {"time": normalized, "channel_id": channel.id}
+        save_merge_config(interaction.guild_id, config)
+        self._register_schedule(interaction.guild_id, config["schedule"])
+        await interaction.response.send_message(
+            f"Daily merge scheduled for `{normalized}` (bot-host time) in {channel.mention}.",
+            ephemeral=True,
+        )
+
+    @config_group.command(name="unschedule", description="Turn off the daily automatic merge")
+    @require_permissions()
+    async def config_unschedule(self, interaction: discord.Interaction):
+        config = load_merge_config(interaction.guild_id)
+        if not config["schedule"]:
+            await interaction.response.send_message("No daily merge is scheduled.", ephemeral=True)
+            return
+        config["schedule"] = None
+        save_merge_config(interaction.guild_id, config)
+        self._unregister_schedule(interaction.guild_id)
+        await interaction.response.send_message("Daily automatic merge turned off.", ephemeral=True)
+
     @config_group.command(name="show", description="Show the current merge configuration")
     @require_permissions()
     async def config_show(self, interaction: discord.Interaction):
@@ -232,11 +354,17 @@ class MergeCog(commands.Cog):
 
         branch_list = ", ".join(f"`{b}`" for b in config["branches"]) or "_none_"
         ping_str = f"<@{ping_id}>" if ping_id else "_not set_"
+        schedule = config["schedule"]
+        schedule_str = (
+            f"daily at `{schedule['time']}` (bot-host time) in <#{schedule['channel_id']}>"
+            if schedule else "_off_"
+        )
         lines = [
             f"**Repo:** {fmt(config['repo'])}",
             f"**Dev branch:** {fmt(config['dev_branch'])}",
             f"**User branches:** {branch_list}",
             f"**Conflict ping:** {ping_str}",
+            f"**Daily merge:** {schedule_str}",
         ]
         embed = discord.Embed(title="Merge configuration", description="\n".join(lines), color=0x5865F2)
         await interaction.response.send_message(embed=embed, ephemeral=True)

@@ -30,6 +30,8 @@
     "mergeconfig remove": { "roles": [], "channels": [] },
     "mergeconfig ping": { "roles": [], "channels": [] },
     "mergeconfig show": { "roles": [], "channels": [] },
+    "mergeconfig schedule": { "roles": [], "channels": [] },
+    "mergeconfig unschedule": { "roles": [], "channels": [] },
     "schedule remove": {
       "roles": [],
       "channels": []

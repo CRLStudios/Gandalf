@@ -69,7 +69,7 @@ Logs written to `bot.log`.
 | `/schedule list` | Show scheduled jobs |
 | `/repo add name url token?` | Register a git repository |
 | `/merge` | Merge all team branches into dev, then sync them back |
-| `/mergeconfig ...` | Configure `/merge` (repo, dev branch, team branches, conflict ping) |
+| `/mergeconfig ...` | Configure `/merge` (repo, dev branch, team branches, conflict ping, daily schedule) |
 
 ## Team merge (`/merge`)
 
@@ -83,6 +83,9 @@ branch, and one `/merge` command keeps everything in sync.
 3. `/mergeconfig dev develop` — the shared development branch
 4. `/mergeconfig add alice` (repeat per member) — the branches to merge
 5. `/mergeconfig ping @you` — who handles conflicts (defaults to the admin user)
+6. `/mergeconfig schedule 03:30 #code` (optional) — also run the merge
+   automatically every day at that time (bot-host timezone), posting results
+   to the given channel; turn off with `/mergeconfig unschedule`
 
 **What `/merge` does — atomically:**
 
@@ -97,7 +100,10 @@ branch, and one `/merge` command keeps everything in sync.
 
 Branches not found on the remote are reported but don't block the run. If
 someone pushes new work mid-run their branch is left alone and catches up on
-the next `/merge`. Only one merge can run per server at a time.
+the next `/merge`. Only one merge can run per server at a time — scheduled
+daily runs use the exact same flow and guard as a manual `/merge`, so they
+can never collide, and conflicts in a scheduled run ping the handler the
+same way.
 
 Repo access tokens are passed to git via an askpass helper — they are never
 written into `.git/config` or command lines. If your repo uses Git LFS,
