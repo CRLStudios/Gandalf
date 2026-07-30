@@ -33,6 +33,15 @@ async def setup_hook():
 @bot.event
 async def on_ready():
     logger.info("Bot ready: %s (ID %s)", bot.user, bot.user.id)
+    if bot.guilds:
+        for g in bot.guilds:
+            logger.info("Connected to guild: %s (%s)", g.name, g.id)
+    else:
+        logger.warning(
+            "Not a member of any guild — if you just invited the bot and it "
+            "isn't in the member list, the invite was likely missing the 'bot' "
+            "scope (commands can appear without it)."
+        )
     allowed = get_allowed_guilds()
     if not allowed:
         for guild in bot.guilds:
@@ -63,6 +72,7 @@ async def on_guild_join(guild: discord.Guild):
         logger.warning(f"Joined unauthorized guild, leaving: {guild.name} ({guild.id})")
         await guild.leave()
         return
+    logger.info("Joined guild: %s (%s)", guild.name, guild.id)
     guild_dir = SCRIPTS_DIR / str(guild.id)
     guild_dir.mkdir(parents=True, exist_ok=True)
     (guild_dir / f"{guild.name}.txt").touch()
