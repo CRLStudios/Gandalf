@@ -17,6 +17,10 @@ def load_guild_env(guild_id: int) -> dict[str, str]:
 
 
 def set_guild_env(guild_id: int, key: str, value: str):
+    # The env file is line-oriented — an embedded newline would let one value
+    # smuggle in extra variables (e.g. forging REPO_*_URL/_TOKEN entries).
+    if "\n" in key or "\r" in key or "\n" in value or "\r" in value:
+        raise ValueError("Env keys and values must not contain newlines.")
     ENVS_DIR.mkdir(parents=True, exist_ok=True)
     envs = load_guild_env(guild_id)
     envs[key] = value

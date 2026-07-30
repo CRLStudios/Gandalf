@@ -1,0 +1,401 @@
+import logging
+import re
+import time
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from utils.gitops import build_git_env, git
+from utils.merge_config import load_merge_config, save_merge_config
+from utils.merge_engine import BranchResult, MergeEngine, MergeReport
+from utils.permissions import check_permissions, get_admin_user_id, require_permissions
+from utils.repos import repo_credentials, repo_names, repo_workspace
+
+logger = logging.getLogger(__name__)
+
+BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+
+EMBED_DESC_LIMIT = 4096
+
+STATUS_LINES = {
+    "merged": "🔀 `{branch}` — merged (+{commits} commit{s})",
+    "up_to_date": "✔ `{branch}` — already up to date",
+    "missing": "⚠ `{branch}` — not found on the remote (has this member pushed yet?)",
+}
+
+SYNC_NOTES = {
+    "synced": "",
+    "in_sync": "",
+    "sync_skipped": " · ⚠ new work was pushed mid-run, it will be picked up next `/merge`",
+    "sync_failed": " · ⚠ could not sync this branch back (see bot.log) — it will retry next `/merge`",
+}
+
+
+def _valid_branch(name: str) -> bool:
+    return bool(BRANCH_PATTERN.match(name)) and ".." not in name and not name.endswith((".lock", "/", "."))
+
+
+class MergeCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        # Guilds with a merge in flight. A plain set mutated before any await
+        # is race-free on the event loop, unlike check-then-acquire on a Lock
+        # (which would silently queue a second run instead of rejecting it).
+        self._running: set[int] = set()
+
+    # ------------------------------------------------------------------ /merge
+
+    @app_commands.command(
+        name="merge",
+        description="Merge everyone's branches into the dev branch and sync them all back up",
+    )
+    @app_commands.guild_only()
+    @require_permissions()
+    async def merge(self, interaction: discord.Interaction):
+        guild_id = interaction.guild_id
+        if guild_id in self._running:
+            await interaction.response.send_message(
+                "A merge is already running for this server — wait for it to finish.",
+                ephemeral=True,
+            )
+            return
+        self._running.add(guild_id)
+        try:
+            await self._run_merge(interaction, guild_id)
+        finally:
+            self._running.discard(guild_id)
+
+    async def _run_merge(self, interaction: discord.Interaction, guild_id: int):
+        age = (discord.utils.utcnow() - interaction.created_at).total_seconds()
+        logger.info("/merge invoked by %s; interaction age at handler entry: %.2fs",
+                    interaction.user, age)
+        config = load_merge_config(guild_id)
+        error = self._config_error(guild_id, config)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+
+        repo = config["repo"] or repo_names(guild_id)[0]
+        url, token = repo_credentials(guild_id, repo)
+        engine = MergeEngine(repo_workspace(guild_id, repo), url, token)
+
+        try:
+            await interaction.response.send_message(f"🧙 Merge run started for `{repo}`…")
+            status_msg = await interaction.original_response()
+        except discord.HTTPException:
+            # Interaction token already expired (slow delivery/ack). Discord
+            # shows "did not respond", but the merge itself must still run —
+            # fall back to plain channel messages for progress and results.
+            logger.warning("Interaction ack failed; falling back to channel messages")
+            status_msg = await interaction.channel.send(
+                f"🧙 Merge run started for `{repo}`…"
+            )
+        last_edit = 0.0
+
+        async def progress(text: str):
+            nonlocal last_edit
+            # Throttled so a long branch list can't stall the run on rate limits.
+            if time.monotonic() - last_edit < 2.0:
+                return
+            last_edit = time.monotonic()
+            try:
+                await status_msg.edit(content=f"🧙 {text}")
+            except discord.HTTPException:
+                pass
+
+        report = await engine.run(config["dev_branch"], config["branches"], progress)
+
+        content, embed = self._build_report_message(config, repo, report)
+        await self._deliver_report(interaction, status_msg, content, embed)
+
+    @staticmethod
+    async def _deliver_report(
+        interaction: discord.Interaction,
+        status_msg: discord.Message,
+        content: str,
+        embed: discord.Embed,
+    ):
+        if content:
+            # Mentions added via edit don't notify — a ping needs a fresh
+            # message. Send it BEFORE deleting the status message so a failed
+            # send can never lose the conflict report.
+            try:
+                await interaction.channel.send(
+                    content=content, embed=embed,
+                    allowed_mentions=discord.AllowedMentions(users=True),
+                )
+            except discord.HTTPException:
+                logger.exception("Failed to send merge report with ping")
+                try:
+                    await status_msg.edit(content=content, embed=embed)
+                except discord.HTTPException:
+                    logger.exception("Fallback merge report edit failed too")
+                return
+            try:
+                await status_msg.delete()
+            except discord.HTTPException:
+                pass
+        else:
+            try:
+                await status_msg.edit(content=None, embed=embed)
+            except discord.HTTPException:
+                try:
+                    await interaction.channel.send(embed=embed)
+                except discord.HTTPException:
+                    logger.exception("Failed to deliver merge report")
+
+    # ------------------------------------------------------- /mergeconfig ...
+
+    config_group = app_commands.Group(
+        name="mergeconfig", description="Configure the /merge command", guild_only=True
+    )
+
+    @config_group.command(name="repo", description="Pick which registered repo /merge operates on")
+    @app_commands.describe(name="Repo name (from /repo list)")
+    @require_permissions()
+    async def config_repo(self, interaction: discord.Interaction, name: str):
+        name_upper = name.upper()
+        if name_upper not in repo_names(interaction.guild_id):
+            await interaction.response.send_message(
+                f"Repo `{name_upper}` is not registered — add it with `/repo add` first.", ephemeral=True
+            )
+            return
+        config = load_merge_config(interaction.guild_id)
+        config["repo"] = name_upper
+        save_merge_config(interaction.guild_id, config)
+        await interaction.response.send_message(f"/merge now operates on `{name_upper}`.", ephemeral=True)
+
+    @config_group.command(name="dev", description="Set the shared development branch")
+    @app_commands.describe(branch="Branch everyone's work is merged into (e.g. develop)")
+    @require_permissions()
+    async def config_dev(self, interaction: discord.Interaction, branch: str):
+        if not _valid_branch(branch):
+            await interaction.response.send_message("That doesn't look like a valid branch name.", ephemeral=True)
+            return
+        config = load_merge_config(interaction.guild_id)
+        config["dev_branch"] = branch
+        if branch in config["branches"]:
+            config["branches"].remove(branch)
+        save_merge_config(interaction.guild_id, config)
+        await interaction.response.send_message(f"Development branch set to `{branch}`.", ephemeral=True)
+
+    @config_group.command(name="add", description="Add a team member's branch to the merge list")
+    @app_commands.describe(branch="Branch name to include in /merge")
+    @require_permissions()
+    async def config_add(self, interaction: discord.Interaction, branch: str):
+        if not _valid_branch(branch):
+            await interaction.response.send_message("That doesn't look like a valid branch name.", ephemeral=True)
+            return
+        config = load_merge_config(interaction.guild_id)
+        if branch == config["dev_branch"]:
+            await interaction.response.send_message(
+                f"`{branch}` is the development branch — it can't also be a user branch.", ephemeral=True
+            )
+            return
+        if branch in config["branches"]:
+            await interaction.response.send_message(f"`{branch}` is already in the merge list.", ephemeral=True)
+            return
+        config["branches"].append(branch)
+        save_merge_config(interaction.guild_id, config)
+        await interaction.response.send_message(f"Added `{branch}` to the merge list.", ephemeral=True)
+
+    @config_group.command(name="remove", description="Remove a branch from the merge list")
+    @app_commands.describe(branch="Branch name to remove")
+    @require_permissions()
+    async def config_remove(self, interaction: discord.Interaction, branch: str):
+        config = load_merge_config(interaction.guild_id)
+        if branch not in config["branches"]:
+            await interaction.response.send_message(f"`{branch}` is not in the merge list.", ephemeral=True)
+            return
+        config["branches"].remove(branch)
+        save_merge_config(interaction.guild_id, config)
+        await interaction.response.send_message(f"Removed `{branch}` from the merge list.", ephemeral=True)
+
+    @config_group.command(name="ping", description="Who gets pinged when a merge conflict needs resolving")
+    @app_commands.describe(user="Team member to ping on conflicts")
+    @require_permissions()
+    async def config_ping(self, interaction: discord.Interaction, user: discord.Member):
+        config = load_merge_config(interaction.guild_id)
+        config["ping_user_id"] = user.id
+        save_merge_config(interaction.guild_id, config)
+        await interaction.response.send_message(f"{user.mention} will be pinged on merge conflicts.", ephemeral=True)
+
+    @config_group.command(name="show", description="Show the current merge configuration")
+    @require_permissions()
+    async def config_show(self, interaction: discord.Interaction):
+        config = load_merge_config(interaction.guild_id)
+        ping_id = config["ping_user_id"] or get_admin_user_id()
+
+        def fmt(value):
+            return f"`{value}`" if value else "_not set_"
+
+        branch_list = ", ".join(f"`{b}`" for b in config["branches"]) or "_none_"
+        ping_str = f"<@{ping_id}>" if ping_id else "_not set_"
+        lines = [
+            f"**Repo:** {fmt(config['repo'])}",
+            f"**Dev branch:** {fmt(config['dev_branch'])}",
+            f"**User branches:** {branch_list}",
+            f"**Conflict ping:** {ping_str}",
+        ]
+        embed = discord.Embed(title="Merge configuration", description="\n".join(lines), color=0x5865F2)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ------------------------------------------------------------ autocomplete
+
+    @config_repo.autocomplete("name")
+    async def repo_autocomplete(self, interaction: discord.Interaction, current: str):
+        # Autocomplete bypasses command checks — gate it explicitly or any
+        # member could enumerate repo names.
+        if check_permissions(interaction, "mergeconfig repo"):
+            return []
+        return [
+            app_commands.Choice(name=n, value=n)
+            for n in repo_names(interaction.guild_id)
+            if current.upper() in n
+        ][:25]
+
+    @config_remove.autocomplete("branch")
+    async def remove_autocomplete(self, interaction: discord.Interaction, current: str):
+        if check_permissions(interaction, "mergeconfig remove"):
+            return []
+        config = load_merge_config(interaction.guild_id)
+        return [
+            app_commands.Choice(name=b, value=b)
+            for b in config["branches"]
+            if current.lower() in b.lower()
+        ][:25]
+
+    @config_add.autocomplete("branch")
+    async def add_autocomplete(self, interaction: discord.Interaction, current: str):
+        """Suggest remote branches from the cloned workspace, if it exists."""
+        if check_permissions(interaction, "mergeconfig add"):
+            return []
+        config = load_merge_config(interaction.guild_id)
+        repo = config["repo"]
+        if not repo:
+            return []
+        workspace = repo_workspace(interaction.guild_id, repo)
+        if not (workspace / ".git").exists():
+            return []
+        try:
+            _, out, _ = await git(
+                "for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/origin",
+                cwd=workspace, env=build_git_env(), timeout=2,
+            )
+        except Exception:
+            return []
+        taken = set(config["branches"]) | {config["dev_branch"], "HEAD"}
+        return [
+            app_commands.Choice(name=b, value=b)
+            for b in out.strip().splitlines()
+            if b and b not in taken and current.lower() in b.lower()
+        ][:25]
+
+    # ----------------------------------------------------------------- helpers
+
+    def _config_error(self, guild_id: int, config: dict) -> str | None:
+        names = repo_names(guild_id)
+        if not names:
+            return "No repo registered yet — add one with `/repo add`."
+        if config["repo"] and config["repo"] not in names:
+            return f"Configured repo `{config['repo']}` is no longer registered — fix it with `/mergeconfig repo`."
+        if not config["repo"] and len(names) > 1:
+            return "Several repos are registered — pick one with `/mergeconfig repo`."
+        if not config["dev_branch"]:
+            return "No development branch set — set it with `/mergeconfig dev`."
+        if not config["branches"]:
+            return "No user branches configured — add them with `/mergeconfig add`."
+        return None
+
+    def _build_report_message(
+        self, config: dict, repo: str, report: MergeReport
+    ) -> tuple[str, discord.Embed | None]:
+        if report.conflict is not None:
+            return self._conflict_message(config, repo, report)
+
+        if not report.ok:
+            embed = discord.Embed(
+                title="❌ Merge failed",
+                description=report.error or "Unknown error.",
+                color=0xE74C3C,
+            )
+            embed.set_footer(text=f"{repo} · dev branch: {report.dev_branch}")
+            return "", embed
+
+        lines = []
+        for r in report.results:
+            line = STATUS_LINES[r.status].format(
+                branch=r.branch, commits=r.commits, s="s" if r.commits != 1 else ""
+            )
+            lines.append(line + SYNC_NOTES.get(r.sync, ""))
+
+        if report.dev_new_commits:
+            summary = f"`{report.dev_branch}` gained **{report.dev_new_commits}** new commit{'s' if report.dev_new_commits != 1 else ''}. Everyone's branch now matches `{report.dev_branch}` — pull before you keep working!"
+        else:
+            summary = f"Nothing new to merge — `{report.dev_branch}` already had everyone's work. Branches were synced back up where needed."
+
+        description = "\n".join(lines) + "\n\n" + summary
+        if len(description) > EMBED_DESC_LIMIT:
+            description = description[: EMBED_DESC_LIMIT - 1] + "…"
+        embed = discord.Embed(
+            title="✅ Merge complete",
+            description=description,
+            color=0x2ECC71,
+        )
+        embed.set_footer(text=f"{repo} · dev branch: {report.dev_branch}")
+        return "", embed
+
+    def _conflict_message(
+        self, config: dict, repo: str, report: MergeReport
+    ) -> tuple[str, discord.Embed]:
+        conflict: BranchResult = report.conflict
+        files = conflict.conflict_files
+
+        # Dev doesn't contain the branches that merged cleanly this run (nothing
+        # was pushed), so the resolver must replay them before the conflicting
+        # merge or the conflict won't reproduce / will bounce to the next run.
+        prior = [r.branch for r in report.results if r.status == "merged"]
+
+        def build(max_files: int) -> str:
+            shown = "\n".join(f"• `{f}`" for f in files[:max_files])
+            if len(files) > max_files:
+                shown += f"\n… and {len(files) - max_files} more"
+            prior_merges = "".join(f"git merge origin/{b}\n" for b in prior)
+            instructions = (
+                f"git checkout {report.dev_branch}\n"
+                f"git pull\n"
+                f"{prior_merges}"
+                f"git merge origin/{conflict.branch}   # <- conflict happens here\n"
+                f"# fix the conflicted files, then:\n"
+                f"git add -A\n"
+                f"git commit\n"
+                f"git push"
+            )
+            return (
+                "The run was stopped and **nothing was pushed** — all branches are untouched.\n\n"
+                f"**Conflicting files:**\n{shown}\n\n"
+                f"**To resolve, in your own clone:**\n```sh\n{instructions}\n```\n"
+                "Then run `/merge` again."
+            )
+
+        description = build(20)
+        if len(description) > EMBED_DESC_LIMIT:
+            description = build(5)
+        if len(description) > EMBED_DESC_LIMIT:
+            description = description[: EMBED_DESC_LIMIT - 1] + "…"
+
+        embed = discord.Embed(
+            title=f"⛔ Conflict merging `{conflict.branch}` into `{report.dev_branch}`",
+            description=description,
+            color=0xE74C3C,
+        )
+        embed.set_footer(text=f"{repo} · dev branch: {report.dev_branch}")
+
+        ping_id = config["ping_user_id"] or get_admin_user_id()
+        content = f"<@{ping_id}> a merge conflict needs your attention." if ping_id else ""
+        return content, embed
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(MergeCog(bot))

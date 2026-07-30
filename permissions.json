@@ -1,5 +1,5 @@
 {
-  "admin_user_id": "1197208967160545456",
+  "admin_user_id": "323319762966937613",
   "allowed_guilds": [988122446383153193],
   "commands": {
     "hello": {
@@ -18,6 +18,18 @@
       "roles": [],
       "channels": []
     },
+    "merge": {
+      "roles": ["Gandalf User"],
+      "channels": ["code"]
+    },
+    "repo add": { "roles": [], "channels": [] },
+    "repo remove": { "roles": [], "channels": [] },
+    "mergeconfig repo": { "roles": [], "channels": [] },
+    "mergeconfig dev": { "roles": [], "channels": [] },
+    "mergeconfig add": { "roles": [], "channels": [] },
+    "mergeconfig remove": { "roles": [], "channels": [] },
+    "mergeconfig ping": { "roles": [], "channels": [] },
+    "mergeconfig show": { "roles": [], "channels": [] },
     "schedule remove": {
       "roles": [],
       "channels": []

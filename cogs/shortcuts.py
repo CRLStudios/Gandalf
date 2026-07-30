@@ -11,7 +11,10 @@ from cogs.scripts import ScriptsCog
 
 logger = logging.getLogger(__name__)
 
-RESERVED_NAMES = {"run", "list", "schedule", "unschedule", "schedules"}
+RESERVED_NAMES = {
+    "run", "list", "schedule", "unschedule", "schedules",
+    "merge", "mergeconfig", "repo", "env",
+}
 
 
 def _load_shortcuts() -> tuple[dict[str, dict], dict[int, dict[str, dict]]]:

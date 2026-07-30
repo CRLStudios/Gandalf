@@ -5,9 +5,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import WORKSPACES_DIR
-from utils.guild_env import set_guild_env, remove_guild_env, load_guild_env
-from utils.permissions import require_permissions
+from utils.guild_env import set_guild_env, remove_guild_env
+from utils.permissions import autocomplete_allowed, require_permissions
+from utils.repos import repo_names, repo_workspace
 
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 
@@ -19,14 +19,7 @@ class ReposCog(commands.Cog):
     repo_group = app_commands.Group(name="repo", description="Manage guild repositories")
 
     def _repo_names(self, guild_id: int) -> list[str]:
-        envs = load_guild_env(guild_id)
-        names = []
-        for k in envs:
-            if k.startswith("REPO_") and k.endswith("_URL"):
-                name = k[5:-4]  # strip REPO_ and _URL
-                if name:
-                    names.append(name)
-        return sorted(names)
+        return repo_names(guild_id)
 
     @repo_group.command(name="add", description="Add a repository")
     @app_commands.describe(name="Repo name (alphanumeric + _)", url="Git clone URL", token="Optional access token")
@@ -35,6 +28,9 @@ class ReposCog(commands.Cog):
         name_upper = name.upper()
         if not NAME_PATTERN.match(name):
             await interaction.response.send_message("Name must match `[A-Za-z0-9_]+`.", ephemeral=True)
+            return
+        if url.startswith("-"):
+            await interaction.response.send_message("Invalid URL.", ephemeral=True)
             return
         set_guild_env(interaction.guild_id, f"REPO_{name_upper}_URL", url)
         if token:
@@ -67,9 +63,12 @@ class ReposCog(commands.Cog):
     @app_commands.describe(name="Repo name")
     @require_permissions()
     async def repo_status(self, interaction: discord.Interaction, name: str):
+        if not NAME_PATTERN.match(name):
+            await interaction.response.send_message("Name must match `[A-Za-z0-9_]+`.", ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True)
         name_upper = name.upper()
-        repo_dir = WORKSPACES_DIR / str(interaction.guild_id) / name_upper.lower()
+        repo_dir = repo_workspace(interaction.guild_id, name_upper)
 
         if not repo_dir.is_dir():
             await interaction.followup.send(f"`{name_upper}` not cloned.", ephemeral=True)
@@ -97,6 +96,8 @@ class ReposCog(commands.Cog):
     @repo_remove.autocomplete("name")
     @repo_status.autocomplete("name")
     async def name_autocomplete(self, interaction: discord.Interaction, current: str):
+        if not autocomplete_allowed(interaction):
+            return []
         names = self._repo_names(interaction.guild_id)
         return [
             app_commands.Choice(name=n, value=n)

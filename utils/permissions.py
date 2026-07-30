@@ -66,16 +66,22 @@ def check_permissions(interaction: Interaction, command_name: str) -> str | None
     return None
 
 
+def resolve_command_name(interaction: Interaction) -> str:
+    name = interaction.command.name
+    if interaction.command.parent:
+        name = f"{interaction.command.parent.name} {interaction.command.name}"
+    return name
+
+
+def autocomplete_allowed(interaction: Interaction) -> bool:
+    """Autocomplete callbacks bypass command checks — gate them explicitly."""
+    return check_permissions(interaction, resolve_command_name(interaction)) is None
+
+
 def require_permissions(command_name: str | None = None):
     """Decorator. Checks guild allowlist, role, and channel permissions."""
     async def predicate(interaction: Interaction) -> bool:
-        # Resolve command name
-        name = command_name
-        if name is None:
-            name = interaction.command.name
-            if interaction.command.parent:
-                name = f"{interaction.command.parent.name} {interaction.command.name}"
-
+        name = command_name if command_name is not None else resolve_command_name(interaction)
         error = check_permissions(interaction, name)
         if error:
             raise app_commands.CheckFailure(error)

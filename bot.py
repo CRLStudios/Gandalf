@@ -26,6 +26,7 @@ async def setup_hook():
     await bot.load_extension("cogs.shortcuts")
     await bot.load_extension("cogs.env")
     await bot.load_extension("cogs.repos")
+    await bot.load_extension("cogs.merge")
     await bot.tree.sync()
 
 
@@ -66,21 +67,32 @@ async def on_guild_join(guild: discord.Guild):
     guild_dir.mkdir(parents=True, exist_ok=True)
     (guild_dir / f"{guild.name}.txt").touch()
     (WORKSPACES_DIR / str(guild.id)).mkdir(parents=True, exist_ok=True)
-    bot.tree.copy_global_to(guild=guild)
+    # copy_global_to would duplicate every global command in the guild list
+    # (same bug fixed in on_ready earlier) — guild sync alone is correct here.
     await bot.tree.sync(guild=guild)
 
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    command = interaction.command.qualified_name if interaction.command else "?"
     if isinstance(error, app_commands.CheckFailure):
         msg = str(error) or "Permission denied."
+        logger.warning(
+            "Denied /%s for %s (ID %s): %s",
+            command, interaction.user, interaction.user.id, msg,
+        )
     else:
         msg = f"Error: {error}"
+        logger.error("Command /%s failed for %s: %r", command, interaction.user, error)
 
-    if interaction.response.is_done():
-        await interaction.followup.send(msg, ephemeral=True)
-    else:
-        await interaction.response.send_message(msg, ephemeral=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        # Expired interaction token — nothing to deliver the error to.
+        logger.warning("Could not deliver error message for /%s (interaction expired)", command)
 
 
 async def main():

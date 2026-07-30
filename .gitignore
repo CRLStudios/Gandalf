@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 schedules/*.json
+mergeconfigs/
 bot.pid
 bot.log
 venv/

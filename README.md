@@ -67,6 +67,41 @@ Logs written to `bot.log`.
 | `/schedule add script cron channel args?` | Add a cron job |
 | `/schedule remove job_id` | Remove a cron job |
 | `/schedule list` | Show scheduled jobs |
+| `/repo add name url token?` | Register a git repository |
+| `/merge` | Merge all team branches into dev, then sync them back |
+| `/mergeconfig ...` | Configure `/merge` (repo, dev branch, team branches, conflict ping) |
+
+## Team merge (`/merge`)
+
+Built for teams where not everyone knows git: each member works on their own
+branch, and one `/merge` command keeps everything in sync.
+
+**Setup (once):**
+
+1. `/repo add name:GAME url:https://github.com/you/game.git token:<PAT>` — register the repo
+2. `/mergeconfig repo GAME` — point /merge at it (optional if only one repo)
+3. `/mergeconfig dev develop` — the shared development branch
+4. `/mergeconfig add alice` (repeat per member) — the branches to merge
+5. `/mergeconfig ping @you` — who handles conflicts (defaults to the admin user)
+
+**What `/merge` does — atomically:**
+
+1. Fetches the repo into the bot's workspace
+2. Merges every configured branch into the dev branch **locally**
+3. If **any** merge conflicts: everything is aborted, **nothing is pushed**, and
+   the conflict-handler is pinged with the branch, the conflicting files, and
+   copy-paste commands to resolve it in their own clone
+4. If all merges are clean: dev is pushed, then every user branch is
+   fast-forwarded to match dev — after a clean run the whole team has identical
+   history and everyone just pulls
+
+Branches not found on the remote are reported but don't block the run. If
+someone pushes new work mid-run their branch is left alone and catches up on
+the next `/merge`. Only one merge can run per server at a time.
+
+Repo access tokens are passed to git via an askpass helper — they are never
+written into `.git/config` or command lines. If your repo uses Git LFS,
+install `git-lfs` on the bot host.
 
 ## Scripts
 
