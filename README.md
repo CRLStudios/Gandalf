@@ -68,8 +68,18 @@ Logs written to `bot.log`.
 | `/schedule remove job_id` | Remove a cron job |
 | `/schedule list` | Show scheduled jobs |
 | `/repo add name url token?` | Register a git repository |
-| `/merge` | Merge all team branches into dev, then sync them back |
-| `/mergeconfig ...` | Configure `/merge` (repo, dev branch, team branches, conflict ping, daily schedule) |
+| `/repo remove name` | Unregister a repository (removes its URL and token) |
+| `/repo list` | Show registered repositories |
+| `/repo status name` | Show `git status` of the bot's clone |
+| `/env set key value` | Set a per-server env var for script runs |
+| `/env remove key` | Remove a per-server env var |
+| `/env list` | Show env var keys (values are never displayed) |
+| `/merge` | Merge all user branches into dev, then sync them back |
+| `/mergeconfig ...` | Configure `/merge` (repo, dev branch, user branches, conflict ping, daily schedule) |
+
+Shortcut commands (e.g. `/deploy`) can be added by mapping a name to a script
+in `shortcuts/global.json` or `shortcuts/<guild_id>.json`; they appear as
+their own slash commands on the next restart.
 
 ## Team merge (`/merge`)
 
