@@ -136,14 +136,11 @@ class MergeCog(commands.Cog):
         """
         if not report.ok or report.dev_head is None:
             return
-        # Reload instead of reusing the run's config: a /mergeconfig edit
-        # made during the merge must not be clobbered by our save below.
         config = load_merge_config(guild_id)
         state = config.get("roundup")
         if not state or state.get("repo") != repo or not state.get("baseline"):
             # First run (or the repo was re-pointed): record silently.
-            config["roundup"] = {"repo": repo, "baseline": report.dev_head}
-            save_merge_config(guild_id, config)
+            self._save_baseline(guild_id, repo, report.dev_head)
             return
         if state["baseline"] == report.dev_head:
             return
@@ -157,8 +154,7 @@ class MergeCog(commands.Cog):
         except GitError:
             # Baseline vanished from history (force-pushed remote) — start over.
             logger.warning("Round-up baseline invalid for guild %s; resetting", guild_id)
-            config["roundup"] = {"repo": repo, "baseline": report.dev_head}
-            save_merge_config(guild_id, config)
+            self._save_baseline(guild_id, repo, report.dev_head)
             return
 
         description = format_roundup(groups, EMBED_DESC_LIMIT)
@@ -172,16 +168,35 @@ class MergeCog(commands.Cog):
         except discord.HTTPException:
             logger.exception("Failed to post round-up for guild %s", guild_id)
             return  # baseline stays — these commits reappear next time
-        config["roundup"] = {"repo": repo, "baseline": report.dev_head}
+        self._save_baseline(guild_id, repo, report.dev_head)
+
+    roundup_group = app_commands.Group(
+        name="roundup", description="Round-up of tagged changes on the dev branch", guild_only=True
+    )
+
+    @roundup_group.command(name="show", description="Preview the pending round-up (only you see it)")
+    @require_permissions()
+    async def roundup_show(self, interaction: discord.Interaction):
+        await self._roundup_command(interaction, "show")
+
+    @roundup_group.command(name="post", description="Post the pending round-up here for everyone, starting a fresh period")
+    @require_permissions()
+    async def roundup_post(self, interaction: discord.Interaction):
+        await self._roundup_command(interaction, "post")
+
+    @roundup_group.command(name="skip", description="Move the round-up baseline to the current dev head without posting")
+    @require_permissions()
+    async def roundup_skip(self, interaction: discord.Interaction):
+        await self._roundup_command(interaction, "skip")
+
+    def _save_baseline(self, guild_id: int, repo: str, tip: str):
+        # Reload instead of reusing the caller's config: a /mergeconfig edit
+        # made in the meantime must not be clobbered by this save.
+        config = load_merge_config(guild_id)
+        config["roundup"] = {"repo": repo, "baseline": tip}
         save_merge_config(guild_id, config)
 
-    @app_commands.command(
-        name="roundup",
-        description="Preview the tagged changes waiting for the next daily round-up",
-    )
-    @app_commands.guild_only()
-    @require_permissions()
-    async def roundup(self, interaction: discord.Interaction):
+    async def _roundup_command(self, interaction: discord.Interaction, mode: str):
         guild_id = interaction.guild_id
         if guild_id in self._running:
             await interaction.response.send_message(
@@ -197,9 +212,11 @@ class MergeCog(commands.Cog):
                 return
             repo = config["repo"] or repo_names(guild_id)[0]
             state = config.get("roundup")
-            if not state or state.get("repo") != repo or not state.get("baseline"):
+            has_baseline = bool(state and state.get("repo") == repo and state.get("baseline"))
+            if not has_baseline and mode != "skip":
                 await interaction.response.send_message(
-                    "No round-up baseline yet — it's recorded by the first scheduled merge.",
+                    "No round-up baseline yet — wait for the first scheduled merge, "
+                    "or start one from the current head with `/roundup skip`.",
                     ephemeral=True,
                 )
                 return
@@ -210,6 +227,8 @@ class MergeCog(commands.Cog):
                 )
                 return
 
+            # The public post is sent separately via the channel, so the
+            # interaction side of every mode stays ephemeral.
             await interaction.response.defer(ephemeral=True)
             _, token = repo_credentials(guild_id, repo)
             env = build_git_env(token)
@@ -226,17 +245,90 @@ class MergeCog(commands.Cog):
                         ephemeral=True,
                     )
                     return
-                groups = await collect_roundup(workspace, env, state["baseline"], out.strip())
+                tip = out.strip()
+
+                if mode == "skip":
+                    await self._roundup_skip_body(
+                        interaction, guild_id, repo, config, state, has_baseline, workspace, env, tip
+                    )
+                    return
+
+                groups = await collect_roundup(workspace, env, state["baseline"], tip)
             except GitError as e:
                 await interaction.followup.send(f"Could not read the repo: {e}", ephemeral=True)
                 return
 
-            description = format_roundup(groups, EMBED_DESC_LIMIT) or "No tagged changes since the last round-up."
-            embed = discord.Embed(title="📋 Round-up preview", description=description, color=0x5865F2)
-            embed.set_footer(text=f"{repo} · posts with the next daily merge")
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            description = format_roundup(groups, EMBED_DESC_LIMIT)
+            if mode == "show":
+                embed = discord.Embed(
+                    title="📋 Round-up preview",
+                    description=description or "No tagged changes since the last round-up.",
+                    color=0x5865F2,
+                )
+                embed.set_footer(text=f"{repo} · posts with the next daily merge")
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+
+            # mode == "post"
+            if description is None:
+                await interaction.followup.send(
+                    "No tagged changes since the last round-up — nothing to post.", ephemeral=True
+                )
+                return
+            embed = discord.Embed(title="📋 Round-up", description=description, color=0x5865F2)
+            embed.set_footer(text=f"{repo} · changes since the last round-up")
+            try:
+                await interaction.channel.send(embed=embed)
+            except discord.HTTPException:
+                logger.exception("Failed to post round-up for guild %s", guild_id)
+                await interaction.followup.send(
+                    "Could not post the round-up in this channel.", ephemeral=True
+                )
+                return  # baseline stays — nothing was published
+            self._save_baseline(guild_id, repo, tip)
+            await interaction.followup.send(
+                "Round-up posted — the next one covers changes from now on.", ephemeral=True
+            )
         finally:
             self._running.discard(guild_id)
+
+    async def _roundup_skip_body(
+        self,
+        interaction: discord.Interaction,
+        guild_id: int,
+        repo: str,
+        config: dict,
+        state: dict | None,
+        has_baseline: bool,
+        workspace,
+        env: dict,
+        tip: str,
+    ):
+        if not has_baseline:
+            self._save_baseline(guild_id, repo, tip)
+            await interaction.followup.send(
+                "Round-up baseline started at the current "
+                f"`{config['dev_branch']}` head — the next round-up covers changes from now on.",
+                ephemeral=True,
+            )
+            return
+        if state["baseline"] == tip:
+            await interaction.followup.send(
+                "The baseline is already at the current head — nothing to skip.", ephemeral=True
+            )
+            return
+        # Count what's being discarded so a fat-fingered skip is visible.
+        note = ""
+        try:
+            groups = await collect_roundup(workspace, env, state["baseline"], tip)
+            skipped = sum(len(entries) for entries in groups.values())
+            note = f"**{skipped}** tagged entr{'y' if skipped == 1 else 'ies'} skipped."
+        except GitError:
+            note = "the old baseline was missing from history, skipped entries could not be counted."
+        self._save_baseline(guild_id, repo, tip)
+        await interaction.followup.send(
+            f"Baseline moved to the current `{config['dev_branch']}` head — {note}", ephemeral=True
+        )
 
     # ------------------------------------------------------------------ /merge
 
@@ -626,7 +718,8 @@ class MergeCog(commands.Cog):
                 "The run was stopped and **nothing was pushed** — all branches are untouched.\n\n"
                 f"**Conflicting files:**\n{shown}\n\n"
                 f"**To resolve, in your own clone:**\n```sh\n{instructions}\n```\n"
-                "Then run `/merge` again."
+                "Then run `/merge` again — and `/roundup post` if the team "
+                "shouldn't wait for the daily round-up."
             )
 
         description = build(20)

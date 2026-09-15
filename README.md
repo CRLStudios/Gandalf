@@ -76,7 +76,9 @@ Logs written to `bot.log`.
 | `/env list` | Show env var keys (values are never displayed) |
 | `/merge` | Merge all user branches into dev, then sync them back |
 | `/mergeconfig ...` | Configure `/merge` (repo, dev branch, user branches, conflict ping, daily schedule) |
-| `/roundup` | Preview the tagged changes waiting for the next daily round-up (only you see it) |
+| `/roundup show` | Preview the pending round-up (only you see it) |
+| `/roundup post` | Post the pending round-up here for everyone, starting a fresh period |
+| `/roundup skip` | Move the round-up baseline to the current dev head without posting |
 
 Shortcut commands (e.g. `/deploy`) can be added by mapping a name to a script
 in `shortcuts/global.json` or `shortcuts/<guild_id>.json`; they appear as
@@ -139,8 +141,15 @@ of your commit message with a `[Tag]` to include it:
   commits are always skipped.
 - Days with nothing tagged post nothing. Changes merged manually with
   `/merge` mid-day appear in that day's scheduled round-up.
-- `/roundup` shows you (privately) what's accumulated so far, without
+- `/roundup show` shows you (privately) what's accumulated so far, without
   posting or affecting the daily report.
+- `/roundup post` publishes the pending round-up right now in the current
+  channel and starts a fresh period — handy right after resolving a
+  conflict, so the team doesn't wait for the next scheduled merge.
+- `/roundup skip` moves the baseline to the current dev head without
+  posting: everything accumulated so far is dropped from future reports
+  (the reply tells you how many entries were skipped). Also works before
+  the first scheduled merge, to start the round-up clock "from now".
 
 ## Scripts
 

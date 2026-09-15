@@ -63,7 +63,7 @@ A `[Bracketed]` marker starting a commit-message line, filing that line into a r
 _Avoid_: tag (collides with git tags), label, category
 
 **Baseline**:
-The dev-branch commit where the last posted round-up ended; the next round-up covers everything after it. Advances only when a round-up posts.
+The dev-branch commit where the last posted round-up ended; the next round-up covers everything after it. Advances when a round-up posts (scheduled or manual), or deliberately via a skip.
 
 ## Invariants
 
