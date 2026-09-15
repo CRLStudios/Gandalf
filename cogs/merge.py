@@ -8,11 +8,12 @@ from apscheduler.triggers.cron import CronTrigger
 from discord import app_commands
 from discord.ext import commands
 
-from utils.gitops import build_git_env, git
+from utils.gitops import GitError, build_git_env, git
 from utils.merge_config import all_guild_ids, load_merge_config, save_merge_config
 from utils.merge_engine import BranchResult, MergeEngine, MergeReport
 from utils.permissions import check_permissions, get_admin_user_id, require_permissions
 from utils.repos import repo_credentials, repo_names, repo_workspace
+from utils.roundup import collect_roundup, format_roundup
 
 logger = logging.getLogger(__name__)
 
@@ -111,9 +112,129 @@ class MergeCog(commands.Cog):
             repo = config["repo"] or repo_names(guild_id)[0]
             logger.info("Scheduled merge starting for guild %s (repo %s)", guild_id, repo)
             status_msg = await channel.send(f"⏰ Daily merge run started for `{repo}`…")
-            await self._execute(guild_id, config, repo, channel, status_msg)
+            report = await self._execute(guild_id, config, repo, channel, status_msg)
+            await self._post_roundup(guild_id, repo, report, channel)
         except Exception:
             logger.exception("Scheduled merge failed for guild %s", guild_id)
+        finally:
+            self._running.discard(guild_id)
+
+    # ---------------------------------------------------------------- round-up
+
+    async def _post_roundup(
+        self,
+        guild_id: int,
+        repo: str,
+        report: MergeReport,
+        channel: discord.abc.Messageable,
+    ):
+        """After a scheduled run: post the tagged-changes digest, if any.
+
+        The baseline advances only when a round-up actually posts, so
+        commits land in exactly one report even across manual merges,
+        empty days, and failed sends.
+        """
+        if not report.ok or report.dev_head is None:
+            return
+        # Reload instead of reusing the run's config: a /mergeconfig edit
+        # made during the merge must not be clobbered by our save below.
+        config = load_merge_config(guild_id)
+        state = config.get("roundup")
+        if not state or state.get("repo") != repo or not state.get("baseline"):
+            # First run (or the repo was re-pointed): record silently.
+            config["roundup"] = {"repo": repo, "baseline": report.dev_head}
+            save_merge_config(guild_id, config)
+            return
+        if state["baseline"] == report.dev_head:
+            return
+
+        workspace = repo_workspace(guild_id, repo)
+        _, token = repo_credentials(guild_id, repo)
+        try:
+            groups = await collect_roundup(
+                workspace, build_git_env(token), state["baseline"], report.dev_head
+            )
+        except GitError:
+            # Baseline vanished from history (force-pushed remote) — start over.
+            logger.warning("Round-up baseline invalid for guild %s; resetting", guild_id)
+            config["roundup"] = {"repo": repo, "baseline": report.dev_head}
+            save_merge_config(guild_id, config)
+            return
+
+        description = format_roundup(groups, EMBED_DESC_LIMIT)
+        if description is None:
+            return  # nothing tagged — silent, baseline stays
+
+        embed = discord.Embed(title="📋 Daily Round-up", description=description, color=0x5865F2)
+        embed.set_footer(text=f"{repo} · changes since the last round-up")
+        try:
+            await channel.send(embed=embed)
+        except discord.HTTPException:
+            logger.exception("Failed to post round-up for guild %s", guild_id)
+            return  # baseline stays — these commits reappear next time
+        config["roundup"] = {"repo": repo, "baseline": report.dev_head}
+        save_merge_config(guild_id, config)
+
+    @app_commands.command(
+        name="roundup",
+        description="Preview the tagged changes waiting for the next daily round-up",
+    )
+    @app_commands.guild_only()
+    @require_permissions()
+    async def roundup(self, interaction: discord.Interaction):
+        guild_id = interaction.guild_id
+        if guild_id in self._running:
+            await interaction.response.send_message(
+                "A merge is running for this server — try again in a minute.", ephemeral=True
+            )
+            return
+        self._running.add(guild_id)
+        try:
+            config = load_merge_config(guild_id)
+            error = self._config_error(guild_id, config)
+            if error:
+                await interaction.response.send_message(error, ephemeral=True)
+                return
+            repo = config["repo"] or repo_names(guild_id)[0]
+            state = config.get("roundup")
+            if not state or state.get("repo") != repo or not state.get("baseline"):
+                await interaction.response.send_message(
+                    "No round-up baseline yet — it's recorded by the first scheduled merge.",
+                    ephemeral=True,
+                )
+                return
+            workspace = repo_workspace(guild_id, repo)
+            if not (workspace / ".git").exists():
+                await interaction.response.send_message(
+                    "The bot hasn't cloned this repo yet — run `/merge` first.", ephemeral=True
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True)
+            _, token = repo_credentials(guild_id, repo)
+            env = build_git_env(token)
+            try:
+                await git("fetch", "--prune", "origin", cwd=workspace, env=env)
+                rc, out, _ = await git(
+                    "rev-parse", "--verify", "--quiet",
+                    f"refs/remotes/origin/{config['dev_branch']}",
+                    cwd=workspace, env=env, check=False,
+                )
+                if rc != 0:
+                    await interaction.followup.send(
+                        f"Development branch `{config['dev_branch']}` was not found on the remote.",
+                        ephemeral=True,
+                    )
+                    return
+                groups = await collect_roundup(workspace, env, state["baseline"], out.strip())
+            except GitError as e:
+                await interaction.followup.send(f"Could not read the repo: {e}", ephemeral=True)
+                return
+
+            description = format_roundup(groups, EMBED_DESC_LIMIT) or "No tagged changes since the last round-up."
+            embed = discord.Embed(title="📋 Round-up preview", description=description, color=0x5865F2)
+            embed.set_footer(text=f"{repo} · posts with the next daily merge")
+            await interaction.followup.send(embed=embed, ephemeral=True)
         finally:
             self._running.discard(guild_id)
 
@@ -172,7 +293,7 @@ class MergeCog(commands.Cog):
         repo: str,
         channel: discord.abc.Messageable,
         status_msg: discord.Message,
-    ):
+    ) -> MergeReport:
         """Shared merge body for slash-command and scheduled runs."""
         url, token = repo_credentials(guild_id, repo)
         engine = MergeEngine(repo_workspace(guild_id, repo), url, token)
@@ -193,6 +314,7 @@ class MergeCog(commands.Cog):
 
         content, embed = self._build_report_message(config, repo, report)
         await self._deliver_report(channel, status_msg, content, embed)
+        return report
 
     @staticmethod
     async def _deliver_report(

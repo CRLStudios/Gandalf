@@ -39,6 +39,7 @@ class MergeReport:
     error: str | None = None
     pushed: bool = False
     dev_new_commits: int = 0
+    dev_head: str | None = None  # dev tip after the run (only set on ok runs)
 
     @property
     def merged(self) -> list[BranchResult]:
@@ -211,6 +212,7 @@ class MergeEngine:
         await progress("Syncing user branches back up to date…")
         _, head_out, _ = await self._git("rev-parse", "HEAD")
         dev_head = head_out.strip()
+        report.dev_head = dev_head
         for result in report.results:
             if result.status not in ("merged", "up_to_date"):
                 continue

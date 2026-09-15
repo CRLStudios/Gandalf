@@ -76,6 +76,7 @@ Logs written to `bot.log`.
 | `/env list` | Show env var keys (values are never displayed) |
 | `/merge` | Merge all user branches into dev, then sync them back |
 | `/mergeconfig ...` | Configure `/merge` (repo, dev branch, user branches, conflict ping, daily schedule) |
+| `/roundup` | Preview the tagged changes waiting for the next daily round-up (only you see it) |
 
 Shortcut commands (e.g. `/deploy`) can be added by mapping a name to a script
 in `shortcuts/global.json` or `shortcuts/<guild_id>.json`; they appear as
@@ -118,6 +119,28 @@ same way.
 Repo access tokens are passed to git via an askpass helper — they are never
 written into `.git/config` or command lines. If your repo uses Git LFS,
 install `git-lfs` on the bot host.
+
+### Daily round-up
+
+After each scheduled merge that lands changes, the bot posts a **round-up**:
+a digest of what went in since the last one, grouped by tags. Start a line
+of your commit message with a `[Tag]` to include it:
+
+```
+[Dev] Fixed double-jump through platforms
+[Art] New forest tileset
+```
+
+- Tags are case-insensitive (`[dev]`, `[Dev]`, `[DEV]` group together) and
+  displayed Title-cased; any tag name works — no fixed list.
+- Every line of the commit message is scanned, so one commit can feed
+  several sections. With several tags on one line, the first wins.
+- Untagged lines stay out of the report; merge commits and the bot's own
+  commits are always skipped.
+- Days with nothing tagged post nothing. Changes merged manually with
+  `/merge` mid-day appear in that day's scheduled round-up.
+- `/roundup` shows you (privately) what's accumulated so far, without
+  posting or affecting the daily report.
 
 ## Scripts
 

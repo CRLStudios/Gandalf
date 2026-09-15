@@ -9,6 +9,7 @@ DEFAULT_CONFIG = {
     "branches": [],        # user branches merged into dev_branch
     "ping_user_id": None,  # who gets pinged on conflict (falls back to admin_user_id)
     "schedule": None,      # {"time": "HH:MM", "channel_id": int} for daily auto-merge
+    "roundup": None,       # {"repo": name, "baseline": sha} — advances when a round-up posts
 }
 
 

@@ -54,6 +54,17 @@ One atomic execution of the merge workflow: every user branch merges into dev lo
 The user pinged when a merge run hits a conflict, with the files and copy-paste commands to resolve it in their own clone. Defaults to the admin.
 _Avoid_: ping user
 
+**Round-up**:
+The digest of tagged commit-message lines that landed on the dev branch since the baseline, grouped by round-up tag. Posted after a scheduled merge run; previewed on demand without posting.
+_Avoid_: changelog, summary, report (that's the merge report)
+
+**Round-up tag**:
+A `[Bracketed]` marker starting a commit-message line, filing that line into a round-up section. Case-insensitive; an untagged line stays out of the round-up.
+_Avoid_: tag (collides with git tags), label, category
+
+**Baseline**:
+The dev-branch commit where the last posted round-up ended; the next round-up covers everything after it. Advances only when a round-up posts.
+
 ## Invariants
 
 - Exactly one bot process, on one host. All state is files beside the code — no database. Two processes would corrupt state and break the merge guard.

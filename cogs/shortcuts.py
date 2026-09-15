@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 RESERVED_NAMES = {
     "run", "list", "schedule", "unschedule", "schedules",
-    "merge", "mergeconfig", "repo", "env",
+    "merge", "mergeconfig", "repo", "env", "roundup",
 }
 
 
