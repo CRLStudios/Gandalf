@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from utils.roundup import BOT_EMAIL, collect_roundup, format_roundup, parse_message  # noqa: E402
+from utils.roundup import BOT_EMAIL, collect_roundup, format_roundup_pages, parse_message  # noqa: E402
 
 GIT_ENV = {
     **os.environ,
@@ -85,26 +85,58 @@ def test_parse():
     )
     check("tag mid-line does not count", parse_message("fixed [Dev] thing") == [])
     check("leading whitespace ok", parse_message("  [Dev] indented") == [("Dev", "indented")])
+    check(
+        "leading '* ' bullet stripped on tag line",
+        parse_message("[Dev] * bullet item") == [("Dev", "bullet item")],
+    )
+    check(
+        "leading '* ' bullets stripped on section lines",
+        parse_message("[Dev]\n* one\n* two") == [("Dev", "one"), ("Dev", "two")],
+    )
+    check(
+        "markdown emphasis is not a bullet",
+        parse_message("[Dev] **important** fix") == [("Dev", "**important** fix")],
+    )
 
 
 # ------------------------------------------------------------ format_roundup
 
 def test_format():
-    print("format_roundup:")
-    check("empty -> None", format_roundup({}) is None)
-    out = format_roundup({"dev": ["a fix"], "art": ["tiles"]})
+    print("format_roundup_pages:")
+    check("empty -> []", format_roundup_pages({}) == [])
+    pages = format_roundup_pages({"dev": ["a fix"], "art": ["tiles"]})
     check(
-        "sections alphabetical, title-cased",
-        out == "**Art**\n• tiles\n\n**Dev**\n• a fix",
-        repr(out),
+        "one page, sections alphabetical, title-cased",
+        pages == ["**Art**\n• tiles\n\n**Dev**\n• a fix"],
+        repr(pages),
     )
-    groups = {"dev": [f"entry number {i}" for i in range(300)]}
-    out = format_roundup(groups, limit=500)
-    check("truncated under limit", len(out) <= 500, f"len={len(out)}")
-    check("truncation note present", "more_" in out and "+" in out, repr(out[-40:]))
-    shown = out.count("• ")
-    claimed = int(out.rsplit("+", 1)[1].split()[0])
-    check("shown + dropped = total", shown + claimed == 300, f"{shown}+{claimed}")
+
+    groups = {"dev": [f"entry number {i}" for i in range(300)], "art": ["tiles"]}
+    pages = format_roundup_pages(groups, limit=500)
+    check("splits into multiple pages", len(pages) > 1, f"pages={len(pages)}")
+    check("every page within limit", all(len(p) <= 500 for p in pages), str([len(p) for p in pages]))
+    total_bullets = sum(p.count("• ") for p in pages)
+    check("no entry lost or truncated", total_bullets == 301, f"bullets={total_bullets}")
+    check(
+        "split section continues with (cont.) header",
+        any(p.startswith("**Dev** _(cont.)_") for p in pages[1:]),
+        repr([p.splitlines()[0] for p in pages]),
+    )
+    check(
+        "no page ends on a bare header",
+        all(not p.splitlines()[-1].startswith("**") for p in pages),
+        repr([p.splitlines()[-1] for p in pages]),
+    )
+    check(
+        "entries stay in order across pages",
+        "\n".join(pages).count("entry number 0\n") >= 1
+        and [f"entry number {i}" in "\n".join(pages) for i in (0, 150, 299)] == [True] * 3,
+    )
+
+    # A single entry longer than a whole page is hard-truncated, not dropped.
+    pages = format_roundup_pages({"dev": ["x" * 900]}, limit=500)
+    check("monster entry truncated with ellipsis", len(pages) == 1 and pages[0].endswith("…")
+          and len(pages[0]) <= 500, str([len(p) for p in pages]))
 
 
 # ----------------------------------------------------------- collect_roundup

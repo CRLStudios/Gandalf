@@ -13,7 +13,7 @@ from utils.merge_config import all_guild_ids, load_merge_config, save_merge_conf
 from utils.merge_engine import BranchResult, MergeEngine, MergeReport
 from utils.permissions import check_permissions, get_admin_user_id, require_permissions
 from utils.repos import repo_credentials, repo_names, repo_workspace
-from utils.roundup import collect_roundup, format_roundup
+from utils.roundup import collect_roundup, format_roundup_pages
 
 logger = logging.getLogger(__name__)
 
@@ -157,17 +157,20 @@ class MergeCog(commands.Cog):
             self._save_baseline(guild_id, repo, report.dev_head)
             return
 
-        description = format_roundup(groups, EMBED_DESC_LIMIT)
-        if description is None:
+        pages = format_roundup_pages(groups, EMBED_DESC_LIMIT)
+        if not pages:
             return  # nothing tagged — silent, baseline stays
 
-        embed = discord.Embed(title="📋 Daily Round-up", description=description, color=0x5865F2)
-        embed.set_footer(text=f"{repo} · changes since the last round-up")
         try:
-            await channel.send(embed=embed)
+            for embed in self._roundup_embeds(
+                "📋 Daily Round-up", pages, f"{repo} · changes since the last round-up"
+            ):
+                await channel.send(embed=embed)
         except discord.HTTPException:
+            # Baseline stays even if some pages made it out: a duplicated
+            # page tomorrow beats silently losing the rest of the report.
             logger.exception("Failed to post round-up for guild %s", guild_id)
-            return  # baseline stays — these commits reappear next time
+            return
         self._save_baseline(guild_id, repo, report.dev_head)
 
     roundup_group = app_commands.Group(
@@ -188,6 +191,20 @@ class MergeCog(commands.Cog):
     @require_permissions()
     async def roundup_skip(self, interaction: discord.Interaction):
         await self._roundup_command(interaction, "skip")
+
+    @staticmethod
+    def _roundup_embeds(title: str, pages: list[str], footer: str) -> list[discord.Embed]:
+        total = len(pages)
+        embeds = []
+        for i, description in enumerate(pages, 1):
+            embed = discord.Embed(
+                title=title if total == 1 else f"{title} — Page {i}/{total}",
+                description=description,
+                color=0x5865F2,
+            )
+            embed.set_footer(text=footer)
+            embeds.append(embed)
+        return embeds
 
     def _save_baseline(self, guild_id: int, repo: str, tip: str):
         # Reload instead of reusing the caller's config: a /mergeconfig edit
@@ -258,33 +275,35 @@ class MergeCog(commands.Cog):
                 await interaction.followup.send(f"Could not read the repo: {e}", ephemeral=True)
                 return
 
-            description = format_roundup(groups, EMBED_DESC_LIMIT)
+            pages = format_roundup_pages(groups, EMBED_DESC_LIMIT)
             if mode == "show":
-                embed = discord.Embed(
-                    title="📋 Round-up preview",
-                    description=description or "No tagged changes since the last round-up.",
-                    color=0x5865F2,
-                )
-                embed.set_footer(text=f"{repo} · posts with the next daily merge")
-                await interaction.followup.send(embed=embed, ephemeral=True)
+                if not pages:
+                    pages = ["No tagged changes since the last round-up."]
+                for embed in self._roundup_embeds(
+                    "📋 Round-up preview", pages, f"{repo} · posts with the next daily merge"
+                ):
+                    await interaction.followup.send(embed=embed, ephemeral=True)
                 return
 
             # mode == "post"
-            if description is None:
+            if not pages:
                 await interaction.followup.send(
                     "No tagged changes since the last round-up — nothing to post.", ephemeral=True
                 )
                 return
-            embed = discord.Embed(title="📋 Round-up", description=description, color=0x5865F2)
-            embed.set_footer(text=f"{repo} · changes since the last round-up")
             try:
-                await interaction.channel.send(embed=embed)
+                for embed in self._roundup_embeds(
+                    "📋 Round-up", pages, f"{repo} · changes since the last round-up"
+                ):
+                    await interaction.channel.send(embed=embed)
             except discord.HTTPException:
+                # Baseline stays even if some pages made it out: a duplicated
+                # page next time beats silently losing the rest of the report.
                 logger.exception("Failed to post round-up for guild %s", guild_id)
                 await interaction.followup.send(
-                    "Could not post the round-up in this channel.", ephemeral=True
+                    "Could not post the full round-up in this channel.", ephemeral=True
                 )
-                return  # baseline stays — nothing was published
+                return
             self._save_baseline(guild_id, repo, tip)
             await interaction.followup.send(
                 "Round-up posted — the next one covers changes from now on.", ephemeral=True

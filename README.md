@@ -147,7 +147,10 @@ Reworked coyote time
   Art). One commit can feed several sections; with several tags on one
   line, the first wins.
 - Lines before the first tag stay out of the report; merge commits and
-  the bot's own commits are always skipped.
+  the bot's own commits are always skipped. A leading `* ` on a line is
+  stripped — the report draws its own bullets.
+- A round-up too big for one Discord message continues across several
+  ("📋 Daily Round-up — Page 1/2", "Page 2/2", …); nothing is cut off.
 - Days with nothing tagged post nothing. Changes merged manually with
   `/merge` mid-day appear in that day's scheduled round-up.
 - `/roundup show` shows you (privately) what's accumulated so far, without

@@ -17,6 +17,9 @@ BOT_EMAIL = "gandalf@bot.invalid"
 # One or more [Tag] markers at the start of a line, then the entry text.
 _LEADING_TAGS = re.compile(r"^\s*((?:\[[^\[\]\n]+\]\s*)+)(.*)$")
 _FIRST_TAG = re.compile(r"\[([^\[\]\n]+)\]")
+# A leading "* " bullet — the report renders its own bullets. The space is
+# required so markdown emphasis like **bold** survives.
+_LEADING_BULLET = re.compile(r"^\*\s+")
 
 
 def parse_message(message: str) -> list[tuple[str, str]]:
@@ -39,6 +42,7 @@ def parse_message(message: str) -> list[tuple[str, str]]:
             text = match.group(2).strip()
         else:
             text = line.strip()
+        text = _LEADING_BULLET.sub("", text)
         if active and text:
             entries.append((active, text))
     return entries
@@ -67,34 +71,49 @@ async def collect_roundup(
     return groups
 
 
-def format_roundup(groups: dict[str, list[str]], limit: int = 4096) -> str | None:
-    """Embed description for the round-up, or None if nothing is tagged.
+def format_roundup_pages(groups: dict[str, list[str]], limit: int = 4096) -> list[str]:
+    """Embed descriptions for the round-up, one per page; [] if nothing tagged.
 
-    Sections are alphabetical; over-long reports drop trailing entries
-    and end with an "+N more" note instead of a mid-line cut.
+    Sections are alphabetical and every entry is kept: a report over the
+    limit continues on the next page, re-opening a split section with a
+    "(cont.)" header. No page ever ends on a bare header.
     """
     if not groups:
-        return None
-    lines: list[str] = []
-    for key in sorted(groups):
-        if lines:
-            lines.append("")
-        lines.append(f"**{key.title()}**")
-        lines.extend(f"• {text}" for text in groups[key])
-    full = "\n".join(lines)
-    if len(full) <= limit:
-        return full
-
-    reserve = 30  # room for the "+N more" suffix
-    kept: list[str] = []
+        return []
+    pages: list[str] = []
+    current: list[str] = []
     used = 0
-    for line in lines:
-        if used + len(line) + 1 > limit - reserve:
-            break
-        kept.append(line)
-        used += len(line) + 1
-    # A section header with all its entries dropped is an orphan.
-    while kept and kept[-1].startswith("**"):
-        kept.pop()
-    dropped = sum(1 for line in lines[len(kept):] if line.startswith("• "))
-    return "\n".join(kept) + f"\n_… +{dropped} more_"
+
+    def add(lines: list[str]):
+        nonlocal used
+        current.extend(lines)
+        used += sum(len(line) + 1 for line in lines)
+
+    def flush():
+        nonlocal current, used
+        if current:
+            pages.append("\n".join(current))
+        current, used = [], 0
+
+    for key in sorted(groups):
+        header = f"**{key.title()}**"
+        in_section = False
+        for text in groups[key]:
+            bullet = f"• {text}"
+            if in_section:
+                block = [bullet]
+            else:
+                block = ([""] if current else []) + [header, bullet]
+            needed = sum(len(line) + 1 for line in block)
+            if current and used + needed > limit:
+                flush()
+                block = [f"{header} _(cont.)_" if in_section else header, bullet]
+                needed = sum(len(line) + 1 for line in block)
+            if used + needed > limit:
+                # A single entry longer than a whole page: hard-truncate it.
+                room = limit - used - (needed - len(bullet)) - 1
+                block[-1] = bullet[: max(room, 0)] + "…"
+            add(block)
+            in_section = True
+    flush()
+    return pages
