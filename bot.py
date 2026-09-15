@@ -105,9 +105,41 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         logger.warning("Could not deliver error message for /%s (interaction expired)", command)
 
 
+shutdown_event = asyncio.Event()
+
+
 async def main():
-    async with bot:
-        await bot.start(BOT_TOKEN)
+    logger.info("Starting Gandalf (discord.py %s)", discord.__version__)
+    delay = 15
+    while True:
+        try:
+            async with bot:
+                await bot.start(BOT_TOKEN)
+            return
+        except AttributeError as exc:
+            # discord.py bug (present in every 2.x release): if the FIRST
+            # gateway connection fails, connect()'s reconnect path reads
+            # self.ws.sequence before self.ws was ever assigned and raises
+            # AttributeError instead of retrying. Retry here ourselves.
+            if "'NoneType' object has no attribute" not in str(exc):
+                raise
+            cause = exc.__context__ or exc.__cause__
+            logger.error(
+                "Discord refused the first gateway connection (%s). This is "
+                "usually a Discord outage — see https://discordstatus.com — "
+                "retrying in %d seconds.",
+                cause if cause is not None else "unknown cause",
+                delay,
+            )
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+        if shutdown_event.is_set():
+            logger.info("Shutdown requested while waiting to reconnect; exiting.")
+            return
+        delay = min(delay * 2, 300)
+        bot.clear()
 
 
 if __name__ == "__main__":
@@ -119,6 +151,7 @@ if __name__ == "__main__":
 
     def _shutdown():
         logger.info("Shutdown signal received, calling bot.close()")
+        shutdown_event.set()
         loop.create_task(_close())
 
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -126,5 +159,10 @@ if __name__ == "__main__":
 
     try:
         loop.run_until_complete(main())
+    except Exception:
+        logger.critical(
+            "Gandalf exited due to an unhandled error:", exc_info=True
+        )
+        raise
     finally:
         loop.close()
