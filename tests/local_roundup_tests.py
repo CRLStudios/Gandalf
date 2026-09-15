@@ -59,16 +59,30 @@ def test_parse():
     print("parse_message:")
     check("simple tag", parse_message("[Dev] fixed jump") == [("Dev", "fixed jump")])
     check(
-        "multi-line, mixed",
-        parse_message("[art] tileset\nuntagged note\n[UI] pause menu")
-        == [("art", "tileset"), ("UI", "pause menu")],
+        "tag is sticky until the next tag",
+        parse_message("[art] tileset\nfollow-up note\n[UI] pause menu")
+        == [("art", "tileset"), ("art", "follow-up note"), ("UI", "pause menu")],
+    )
+    check(
+        "bare tag line: following lines are its items",
+        parse_message("[Dev]\nfix one\nfix two")
+        == [("Dev", "fix one"), ("Dev", "fix two")],
+    )
+    check(
+        "blank lines are skipped, tag stays active",
+        parse_message("[Dev] fix one\n\nfix two")
+        == [("Dev", "fix one"), ("Dev", "fix two")],
     )
     check(
         "multiple leading tags: first wins, rest stripped",
         parse_message("[DEV][Audio] boom sound") == [("DEV", "boom sound")],
     )
     check("untagged only", parse_message("plain message\nsecond line") == [])
-    check("bare tag with no text is dropped", parse_message("[Dev]") == [])
+    check("bare tag alone yields nothing", parse_message("[Dev]") == [])
+    check(
+        "lines before the first tag are omitted",
+        parse_message("intro line\n[Dev] the fix") == [("Dev", "the fix")],
+    )
     check("tag mid-line does not count", parse_message("fixed [Dev] thing") == [])
     check("leading whitespace ok", parse_message("  [Dev] indented") == [("Dev", "indented")])
 
@@ -106,7 +120,7 @@ def test_collect():
     baseline = run_git(repo, "rev-parse", "HEAD")
 
     commit(repo, "[Dev] fixed jump physics")
-    commit(repo, "[art] new tileset\nrandom untagged body line\n[UI] pause menu layout")
+    commit(repo, "[art] new tileset\nextra art detail\n[UI] pause menu layout")
     commit(repo, "[DEV][Audio] explosion sound")
     commit(repo, "untagged commit — must not appear")
 
@@ -132,11 +146,14 @@ def test_collect():
         groups.get("dev") == ["fixed jump physics", "explosion sound", "side branch work"],
         str(groups.get("dev")),
     )
-    check("art entry", groups.get("art") == ["new tileset"], str(groups.get("art")))
+    check(
+        "art entries incl. sticky follow-up line",
+        groups.get("art") == ["new tileset", "extra art detail"],
+        str(groups.get("art")),
+    )
     check("ui entry from body line", groups.get("ui") == ["pause menu layout"], str(groups.get("ui")))
     joined = str(groups)
-    check("baseline/untagged/bot/merge all absent",
-          "must not appear" not in joined and "untagged" not in joined, joined)
+    check("baseline/untagged/bot/merge all absent", "must not appear" not in joined, joined)
 
     empty = asyncio.run(collect_roundup(repo, GIT_ENV, tip, tip))
     check("baseline == tip -> empty", empty == {})

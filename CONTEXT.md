@@ -59,7 +59,7 @@ The digest of tagged commit-message lines that landed on the dev branch since th
 _Avoid_: changelog, summary, report (that's the merge report)
 
 **Round-up tag**:
-A `[Bracketed]` marker starting a commit-message line, filing that line into a round-up section. Case-insensitive; an untagged line stays out of the round-up.
+A `[Bracketed]` marker starting a commit-message line. Sticky: it files that line and every following line into its round-up section until the next tag. Case-insensitive; lines before any tag stay out of the round-up.
 _Avoid_: tag (collides with git tags), label, category
 
 **Baseline**:

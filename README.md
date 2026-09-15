@@ -136,15 +136,18 @@ of your commit message with a `[Tag]` to include it:
 
 ```
 [Dev] Fixed double-jump through platforms
+Reworked coyote time
 [Art] New forest tileset
 ```
 
 - Tags are case-insensitive (`[dev]`, `[Dev]`, `[DEV]` group together) and
   displayed Title-cased; any tag name works — no fixed list.
-- Every line of the commit message is scanned, so one commit can feed
-  several sections. With several tags on one line, the first wins.
-- Untagged lines stay out of the report; merge commits and the bot's own
-  commits are always skipped.
+- A tag is sticky: it covers its own line and every line after it until
+  the next tag, each becoming its own item (above: two Dev items, one
+  Art). One commit can feed several sections; with several tags on one
+  line, the first wins.
+- Lines before the first tag stay out of the report; merge commits and
+  the bot's own commits are always skipped.
 - Days with nothing tagged post nothing. Changes merged manually with
   `/merge` mid-day appear in that day's scheduled round-up.
 - `/roundup show` shows you (privately) what's accumulated so far, without

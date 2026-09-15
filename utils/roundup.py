@@ -1,9 +1,10 @@
 """Round-up: digest of tagged commit-message lines that landed on dev.
 
-A commit-message line starting with [Tag] files under that tag —
-case-insensitive, displayed Title-cased. Untagged lines, merge commits,
-and the bot's own commits are skipped. The report covers baseline..tip;
-the baseline advances only when a round-up actually posts.
+A [Tag] line starts a section: it and every following line file under
+that tag until the next [Tag] line — case-insensitive, displayed
+Title-cased. Lines before any tag, merge commits, and the bot's own
+commits are skipped. The report covers baseline..tip; the baseline
+advances only when a round-up actually posts.
 """
 
 import re
@@ -19,21 +20,27 @@ _FIRST_TAG = re.compile(r"\[([^\[\]\n]+)\]")
 
 
 def parse_message(message: str) -> list[tuple[str, str]]:
-    """(tag, text) per tagged line of one commit message.
+    """(tag, text) entries from one commit message.
 
-    The tag is as typed (caller lower-cases to group); with several
-    leading tags the first wins and the rest are dropped from the text.
+    A tag is sticky: a [Tag] line starts a section and every following
+    non-blank line is an item in it, until the next [Tag] line. Text on
+    the tag line itself is the first item. Lines before any tag are
+    omitted. The tag is as typed (caller lower-cases to group); with
+    several leading tags the first wins and the rest are dropped.
     """
     entries = []
+    active: str | None = None
     for line in message.splitlines():
         match = _LEADING_TAGS.match(line)
-        if not match:
-            continue
-        text = match.group(2).strip()
-        tag = _FIRST_TAG.search(match.group(1)).group(1).strip()
-        if not text or not tag:
-            continue
-        entries.append((tag, text))
+        if match:
+            tag = _FIRST_TAG.search(match.group(1)).group(1).strip()
+            if tag:
+                active = tag
+            text = match.group(2).strip()
+        else:
+            text = line.strip()
+        if active and text:
+            entries.append((active, text))
     return entries
 
 
