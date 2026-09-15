@@ -122,6 +122,12 @@ Repo access tokens are passed to git via an askpass helper — they are never
 written into `.git/config` or command lines. If your repo uses Git LFS,
 install `git-lfs` on the bot host.
 
+During long transfers (the first clone, a big fetch or push) the status
+message updates live with elapsed time and git's own progress, e.g.
+`Receiving objects: 42% (8123/19301), 210.4 MiB | 12.3 MiB/s`. These
+transfers are killed only if git goes completely silent for `GIT_TIMEOUT`
+seconds (default 900) — a slow but moving download is never cut off.
+
 ### Daily round-up
 
 After each scheduled merge that lands changes, the bot posts a **round-up**:

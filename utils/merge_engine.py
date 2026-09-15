@@ -7,7 +7,9 @@ After a clean run, dev is pushed and every user branch is fast-forwarded to
 match dev, so the whole team ends up on identical history.
 """
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -60,11 +62,48 @@ class MergeEngine:
         self.url = url
         self.env = build_git_env(token)
 
-    async def _git(self, *args: str, check: bool = True, timeout: int | None = None):
-        kwargs = {"cwd": self.repo_dir, "env": self.env, "check": check}
+    async def _git(self, *args: str, check: bool = True, timeout: int | None = None, **kwargs):
+        kwargs.update(cwd=self.repo_dir, env=self.env, check=check)
         if timeout is not None:
             kwargs["timeout"] = timeout
         return await git(*args, **kwargs)
+
+    async def _transfer(
+        self, label: str, progress: ProgressCallback, *args: str, cwd_ready: bool = True, **kwargs
+    ):
+        """Run a transfer command (--progress in args) with live feedback.
+
+        The status line shows elapsed time plus git's latest progress line;
+        a ticker keeps the clock moving through git's silent phases. The
+        stall-based timeout comes from gitops streamed mode.
+        """
+        start = time.monotonic()
+        latest = {"line": ""}
+
+        def compose() -> str:
+            mins, secs = divmod(int(time.monotonic() - start), 60)
+            elapsed = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+            text = f"{label} ({elapsed})"
+            if latest["line"]:
+                text += f"\n{latest['line']}"
+            return text
+
+        async def on_line(line: str):
+            latest["line"] = line
+            await progress(compose())
+
+        async def ticker():
+            while True:
+                await asyncio.sleep(5)
+                await progress(compose())
+
+        tick = asyncio.create_task(ticker())
+        try:
+            if cwd_ready:
+                return await self._git(*args, on_progress=on_line, **kwargs)
+            return await git(*args, env=self.env, on_progress=on_line, **kwargs)
+        finally:
+            tick.cancel()
 
     async def _remote_ref(self, branch: str) -> str | None:
         """Commit hash of origin/<branch>, or None if the branch doesn't exist."""
@@ -75,9 +114,12 @@ class MergeEngine:
 
     async def _ensure_workspace(self, progress: ProgressCallback):
         if not (self.repo_dir / ".git").exists():
-            await progress("Cloning repository (first run — this can take a while)…")
             self.repo_dir.parent.mkdir(parents=True, exist_ok=True)
-            await git("clone", self.url, str(self.repo_dir), env=self.env)
+            await self._transfer(
+                "Cloning repository (first run — this can take a while)…", progress,
+                "clone", "--progress", self.url, str(self.repo_dir),
+                cwd_ready=False,
+            )
         else:
             git_dir = self.repo_dir / ".git"
             # A git command killed on timeout (or a host crash) can't remove its
@@ -93,8 +135,10 @@ class MergeEngine:
             # /repo add may have re-pointed this repo at a new URL; the clone
             # keeps the old remote until told otherwise.
             await self._git("remote", "set-url", "origin", self.url)
-            await progress("Fetching latest changes…")
-            await self._git("fetch", "--prune", "origin")
+            await self._transfer(
+                "Fetching latest changes…", progress,
+                "fetch", "--prune", "--progress", "origin",
+            )
         # Identity for merge commits; idempotent and cheap.
         await self._git("config", "user.name", "Gandalf")
         await self._git("config", "user.email", "gandalf@bot.invalid")
@@ -196,11 +240,12 @@ class MergeEngine:
         report.dev_new_commits = int(dev_count_out.strip() or 0)
 
         if report.dev_new_commits > 0:
-            await progress(f"Pushing `{dev_branch}`…")
             # Fully qualified refspec — a tag sharing the dev branch's name
             # would otherwise make the short form ambiguous and fail every run.
-            rc, _, push_err = await self._git(
-                "push", "origin", f"refs/heads/{dev_branch}:refs/heads/{dev_branch}", check=False
+            rc, _, push_err = await self._transfer(
+                f"Pushing `{dev_branch}`…", progress,
+                "push", "--progress", "origin",
+                f"refs/heads/{dev_branch}:refs/heads/{dev_branch}", check=False,
             )
             if rc != 0:
                 raise GitError(
