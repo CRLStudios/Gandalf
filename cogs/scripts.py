@@ -5,7 +5,7 @@ from discord.ext import commands
 from config import WORKSPACES_DIR
 from utils.guild_env import load_guild_env
 from utils.runner import run_script, resolve_script, list_scripts
-from utils.permissions import require_permissions
+from utils.permissions import autocomplete_allowed, require_permissions
 
 
 class ScriptsCog(commands.Cog):
@@ -44,6 +44,10 @@ class ScriptsCog(commands.Cog):
 
     @run_cmd.autocomplete("script")
     async def run_autocomplete(self, interaction: discord.Interaction, current: str):
+        # Autocomplete bypasses command checks — gate it explicitly or any
+        # member could enumerate script names.
+        if not autocomplete_allowed(interaction):
+            return []
         scripts = list_scripts(interaction.guild_id)
         return [
             app_commands.Choice(name=f"{name} ({source})", value=name)

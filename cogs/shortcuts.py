@@ -5,7 +5,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import SHORTCUTS_DIR
+from config import SHORTCUTS_DIR, WORKSPACES_DIR
+from utils.guild_env import load_guild_env
 from utils.runner import run_script, resolve_script
 from cogs.scripts import ScriptsCog
 
@@ -60,7 +61,11 @@ def _make_command(name: str, conf: dict) -> app_commands.Command:
             return
 
         arg_list = args.split() if args else []
-        returncode, stdout, stderr = await run_script(path, arg_list)
+        # Same execution context as /run: guild workspace cwd + guild env.
+        workspace = WORKSPACES_DIR / str(interaction.guild_id)
+        workspace.mkdir(parents=True, exist_ok=True)
+        guild_env = load_guild_env(interaction.guild_id)
+        returncode, stdout, stderr = await run_script(path, arg_list, cwd=workspace, env=guild_env)
 
         embed = ScriptsCog._build_embed(script_name, returncode, stdout, stderr)
         await interaction.followup.send(embed=embed)

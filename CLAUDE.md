@@ -36,11 +36,4 @@ The numbered scenarios in `local_merge_tests.py` are the de-facto spec for the m
 - `check_permissions()` returns `None` when **allowed**, an error string when denied — inverted truthiness; read call sites carefully.
 - User errors: guard clauses at the top of the handler, ephemeral reply naming the fixing command. Infrastructure errors: narrow `except discord.HTTPException` with a fallback; `logger.exception` at outer boundaries.
 - Every user-supplied identifier is validated against a regex allowlist before touching a path, branch name, or argv.
-
-## Known issues (drift — fix, don't imitate)
-
-- `SCRIPT_TIMEOUT` default: **60s is intended** (per setup.sh/.env.example/README); `config.py`'s `600` fallback is the bug.
-- `setup.sh` prompts for and writes `ALLOWED_ROLE`, which nothing reads — roles moved to `permissions.json`.
-- `cogs/merge.py` autocomplete gating is inverted (`if check_permissions(...)` returns empty for *authorized* users); `cogs/repos.py`'s `autocomplete_allowed()` is the correct pattern.
-- `/run` and the scripts/schedule autocompletes are not permission-gated.
-- Scheduled runs execute without the guild workspace cwd and guild env that `/run` provides.
+- Script runs share one execution context everywhere — guild workspace cwd + guild env — whether triggered by `/run`, a shortcut, or a schedule. A new trigger path must pass both to `run_script`.

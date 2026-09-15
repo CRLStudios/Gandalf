@@ -21,9 +21,6 @@ if [ -z "$DISCORD_TOKEN" ]; then
     exit 1
 fi
 
-# Allowed role
-read -p "Allowed role name (leave blank to allow all): " ALLOWED_ROLE
-
 # Script timeout
 read -p "Script timeout in seconds [60]: " SCRIPT_TIMEOUT
 SCRIPT_TIMEOUT=${SCRIPT_TIMEOUT:-60}
@@ -31,12 +28,11 @@ SCRIPT_TIMEOUT=${SCRIPT_TIMEOUT:-60}
 # Write .env
 cat > "$SCRIPT_DIR/.env" <<EOF
 DISCORD_TOKEN=$DISCORD_TOKEN
-ALLOWED_ROLE=$ALLOWED_ROLE
 SCRIPT_TIMEOUT=$SCRIPT_TIMEOUT
 EOF
 
 echo ""
-echo ".env created."
+echo ".env created. Access control is configured in permissions.json (see README)."
 
 # Create virtual environment
 echo "Creating virtual environment..."
