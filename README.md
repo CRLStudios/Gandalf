@@ -74,11 +74,11 @@ Logs written to `bot.log`.
 | `/env set key value` | Set a per-server env var for script runs |
 | `/env remove key` | Remove a per-server env var |
 | `/env list` | Show env var keys (values are never displayed) |
-| `/merge` | Merge all user branches into dev, then sync them back |
-| `/mergeconfig ...` | Configure `/merge` (repo, dev branch, user branches, conflict ping, daily schedule) |
-| `/roundup show` | Preview the pending round-up (only you see it) |
-| `/roundup post` | Post the pending round-up here for everyone, starting a fresh period |
-| `/roundup skip` | Move the round-up baseline to the current dev head without posting |
+| `/merge dev?` | Merge a merge set's user branches into its dev branch, then sync them back (default set if `dev` is omitted) |
+| `/mergeconfig ...` | Configure `/merge` (repo, merge sets, user branches, conflict ping, daily schedule) |
+| `/roundup show dev?` | Preview the pending round-up (only you see it) |
+| `/roundup post dev?` | Post the pending round-up here for everyone, starting a fresh period |
+| `/roundup skip dev?` | Move the round-up baseline to the current dev head without posting |
 
 Shortcut commands (e.g. `/deploy`) can be added by mapping a name to a script
 in `shortcuts/global.json` or `shortcuts/<guild_id>.json`; they appear as
@@ -93,12 +93,42 @@ branch, and one `/merge` command keeps everything in sync.
 
 1. `/repo add name:GAME url:https://github.com/you/game.git token:<PAT>` — register the repo
 2. `/mergeconfig repo GAME` — point /merge at it (optional if only one repo)
-3. `/mergeconfig dev develop` — the shared development branch
+3. `/mergeconfig create develop` — a merge set for the shared development branch
 4. `/mergeconfig add alice` (repeat per member) — the branches to merge
 5. `/mergeconfig ping @you` — who handles conflicts (defaults to the admin user)
 6. `/mergeconfig schedule 03:30 #code` (optional) — also run the merge
    automatically every day at that time (bot-host timezone), posting results
    to the given channel; turn off with `/mergeconfig unschedule`
+
+`/mergeconfig show` lists everything that is configured.
+
+### Merge sets
+
+A **merge set** is one dev branch plus the user branches merged into it. The
+first set you create is the **default set**: `/merge`, `/roundup` and
+`/mergeconfig` act on it whenever `dev:` is left out. Create as many more as
+you need — for example a patch line next to main development:
+
+```
+/mergeconfig create patch-development
+/mergeconfig add alice-patch dev:patch-development
+/mergeconfig add bob-patch dev:patch-development
+/mergeconfig schedule 04:00 #code dev:patch-development    (optional)
+/merge dev:patch-development
+```
+
+- Each set has its own user branches, daily schedule and round-up. The repo
+  and the conflict handler are shared by all sets.
+- A branch belongs to one set only, and a dev branch can't be a user branch
+  in any set — synced back from two dev branches, a branch would carry each
+  one's history into the other.
+- Sets are independent: nothing flows from `patch-development` into
+  `develop` unless someone merges it by hand.
+- `/mergeconfig default <dev>` moves the default, `/mergeconfig rename <dev>
+  <new_branch>` changes a set's dev branch (keeping its branches, schedule
+  and round-up baseline), and `/mergeconfig delete <dev>` removes a set from
+  the config without touching the remote. The default set can only be
+  deleted last.
 
 **What `/merge` does — atomically:**
 
@@ -113,10 +143,12 @@ branch, and one `/merge` command keeps everything in sync.
 
 Branches not found on the remote are reported but don't block the run. If
 someone pushes new work mid-run their branch is left alone and catches up on
-the next `/merge`. Only one merge can run per server at a time — scheduled
-daily runs use the exact same flow and guard as a manual `/merge`, so they
-can never collide, and conflicts in a scheduled run ping the handler the
-same way.
+the next `/merge`. Only one merge can run per server at a time, whichever
+set it is for — scheduled daily runs use the exact same flow and guard as a
+manual `/merge`, so they can never collide, and conflicts in a scheduled run
+ping the handler the same way. A manual `/merge` during a run is turned
+away; a scheduled run waits its turn instead (up to an hour), so two sets
+can share a schedule time.
 
 Repo access tokens are passed to git via an askpass helper — they are never
 written into `.git/config` or command lines. If your repo uses Git LFS,
@@ -131,8 +163,10 @@ seconds (default 900) — a slow but moving download is never cut off.
 ### Daily round-up
 
 After each scheduled merge that lands changes, the bot posts a **round-up**:
-a digest of what went in since the last one, grouped by tags. Start a line
-of your commit message with a `[Tag]` to include it:
+a digest of what went in since the last one, grouped by tags. Every merge
+set keeps its own round-up, and the `/roundup` commands take the same
+optional `dev:` as `/merge`. Start a line of your commit message with a
+`[Tag]` to include it:
 
 ```
 [Dev] Fixed double-jump through platforms
@@ -153,6 +187,9 @@ Reworked coyote time
   ("📋 Daily Round-up — Page 1/2", "Page 2/2", …); nothing is cut off.
 - Days with nothing tagged post nothing. Changes merged manually with
   `/merge` mid-day appear in that day's scheduled round-up.
+- Work carried by hand from one merge set into another (e.g. patch fixes
+  merged into `develop`) shows up in both sets' round-ups — it is new to
+  each dev branch.
 - `/roundup show` shows you (privately) what's accumulated so far, without
   posting or affecting the daily report.
 - `/roundup post` publishes the pending round-up right now in the current

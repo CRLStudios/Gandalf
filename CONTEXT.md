@@ -37,25 +37,32 @@ The bot's own clone of a registered repo. Disposable — the merge run resets it
 _Avoid_: checkout, working copy
 
 **Merge config**:
-A guild's settings for `/merge`: which repo, the dev branch, the user branches, the conflict handler, and an optional daily schedule.
+A guild's settings for `/merge`: which repo, the conflict handler, and its merge sets.
+
+**Merge set**:
+One dev branch plus the user branches merged into it, with its own optional daily schedule and round-up baseline. Identified by its dev branch. A guild can have any number; they are independent — nothing flows between sets.
+_Avoid_: branch set, workflow, pipeline
+
+**Default set**:
+The merge set a command acts on when none is named. The first set created, until moved.
 
 **Dev branch**:
-The shared integration branch every user branch merges into and is synced back from.
+The shared integration branch a merge set's user branches merge into and are synced back from.
 _Avoid_: main, master, trunk
 
 **User branch**:
-One team member's personal branch. Members only ever commit to their own.
+One team member's personal branch in one merge set. Members only ever commit to their own.
 _Avoid_: team branch, member branch, feature branch
 
 **Merge run**:
-One atomic execution of the merge workflow: every user branch merges into dev locally, and only if all are clean does anything push, after which each user branch is fast-forwarded to dev (the *sync-back*). One conflict aborts the entire run with nothing pushed.
+One atomic execution of the merge workflow for one merge set: every user branch merges into dev locally, and only if all are clean does anything push, after which each user branch is fast-forwarded to dev (the *sync-back*). One conflict aborts the entire run with nothing pushed.
 
 **Conflict handler**:
 The user pinged when a merge run hits a conflict, with the files and copy-paste commands to resolve it in their own clone. Defaults to the admin.
 _Avoid_: ping user
 
 **Round-up**:
-The digest of tagged commit-message lines that landed on the dev branch since the baseline, grouped by round-up tag. Posted after a scheduled merge run; previewed on demand without posting.
+The digest of tagged commit-message lines that landed on a merge set's dev branch since its baseline, grouped by round-up tag. Posted after a scheduled merge run; previewed on demand without posting.
 _Avoid_: changelog, summary, report (that's the merge report)
 
 **Round-up tag**:
@@ -68,7 +75,8 @@ The dev-branch commit where the last posted round-up ended; the next round-up co
 ## Invariants
 
 - Exactly one bot process, on one host. All state is files beside the code — no database. Two processes would corrupt state and break the merge guard.
-- At most one merge run in flight per guild; manual and scheduled runs share the same guard.
+- At most one merge run in flight per guild, across all its merge sets (they share one workspace); manual and scheduled runs share the same guard. A manual run that finds it taken is rejected; a scheduled run waits its turn.
+- A branch is in at most one merge set, as its dev branch or as a user branch — never both, never two sets.
 - A merge run is all-or-nothing: no conflict has ever been pushed.
 - Permissions are re-read from disk on every check — changes apply with no restart.
 - All scheduling fires in bot-host local time.

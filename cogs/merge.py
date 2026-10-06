@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import time
@@ -9,9 +10,27 @@ from discord import app_commands
 from discord.ext import commands
 
 from utils.gitops import GitError, build_git_env, git
-from utils.merge_config import all_guild_ids, load_merge_config, save_merge_config
+from utils.merge_config import (
+    MergeConfigError,
+    add_branch,
+    all_guild_ids,
+    branch_owner,
+    create_set,
+    delete_set,
+    load_merge_config,
+    remove_branch,
+    rename_set,
+    resolve_set,
+    save_merge_config,
+    set_default,
+)
 from utils.merge_engine import BranchResult, MergeEngine, MergeReport
-from utils.permissions import check_permissions, get_admin_user_id, require_permissions
+from utils.permissions import (
+    autocomplete_allowed,
+    check_permissions,
+    get_admin_user_id,
+    require_permissions,
+)
 from utils.repos import repo_credentials, repo_names, repo_workspace
 from utils.roundup import collect_roundup, format_roundup_pages
 
@@ -21,6 +40,12 @@ BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 TIME_PATTERN = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 EMBED_DESC_LIMIT = 4096
+
+DEV_OPTION = "Dev branch of the merge set (default set if omitted)"
+
+# A scheduled run that finds another merge in flight waits its turn.
+SCHEDULE_WAIT_POLL = 5      # seconds between checks
+SCHEDULE_WAIT_LIMIT = 3600  # give up (and say so) after this long
 
 STATUS_LINES = {
     "merged": "🔀 `{branch}` — merged (+{commits} commit{s})",
@@ -51,12 +76,15 @@ class MergeCog(commands.Cog):
 
     async def cog_load(self):
         for guild_id in all_guild_ids():
-            schedule = load_merge_config(guild_id).get("schedule")
-            if schedule:
+            for dev, merge_set in load_merge_config(guild_id)["sets"].items():
+                if not merge_set["schedule"]:
+                    continue
                 try:
-                    self._register_schedule(guild_id, schedule)
+                    self._register_schedule(guild_id, dev, merge_set["schedule"])
                 except Exception:
-                    logger.exception("Could not register merge schedule for guild %s", guild_id)
+                    logger.exception(
+                        "Could not register merge schedule for guild %s set %s", guild_id, dev
+                    )
         self.scheduler.start()
 
     async def cog_unload(self):
@@ -64,60 +92,84 @@ class MergeCog(commands.Cog):
 
     # --------------------------------------------------------------- scheduling
 
-    def _job_id(self, guild_id: int) -> str:
-        return f"merge_{guild_id}"
+    def _job_id(self, guild_id: int, dev: str) -> str:
+        return f"merge_{guild_id}_{dev}"
 
-    def _register_schedule(self, guild_id: int, schedule: dict):
+    def _register_schedule(self, guild_id: int, dev: str, schedule: dict):
         hour, minute = (int(p) for p in schedule["time"].split(":"))
         self.scheduler.add_job(
             self._scheduled_merge,
             CronTrigger(hour=hour, minute=minute),
-            id=self._job_id(guild_id),
-            args=[guild_id],
+            id=self._job_id(guild_id, dev),
+            args=[guild_id, dev],
             replace_existing=True,
         )
 
-    def _unregister_schedule(self, guild_id: int):
-        if self.scheduler.get_job(self._job_id(guild_id)):
-            self.scheduler.remove_job(self._job_id(guild_id))
+    def _unregister_schedule(self, guild_id: int, dev: str):
+        if self.scheduler.get_job(self._job_id(guild_id, dev)):
+            self.scheduler.remove_job(self._job_id(guild_id, dev))
 
-    async def _scheduled_merge(self, guild_id: int):
-        config = load_merge_config(guild_id)
-        schedule = config.get("schedule")
-        if not schedule:
-            # Unscheduled after the job was registered — clean up defensively.
-            self._unregister_schedule(guild_id)
-            return
+    async def _claim_turn(self, guild_id: int) -> bool:
+        """Wait for the guild's merge guard, then take it. False if the wait timed out.
 
-        channel = self.bot.get_channel(schedule["channel_id"])
-        if channel is None:
-            try:
-                channel = await self.bot.fetch_channel(schedule["channel_id"])
-            except discord.HTTPException:
-                logger.warning(
-                    "Scheduled merge for guild %s: channel %s unavailable",
-                    guild_id, schedule["channel_id"],
+        Sets share one workspace, so scheduled runs queue behind whatever is
+        in flight instead of skipping — two sets may share a schedule time.
+        The final check and the add have no await between them, which keeps
+        the guard race-free.
+        """
+        waited = 0
+        while guild_id in self._running:
+            if waited >= SCHEDULE_WAIT_LIMIT:
+                return False
+            await asyncio.sleep(SCHEDULE_WAIT_POLL)
+            waited += SCHEDULE_WAIT_POLL
+        self._running.add(guild_id)
+        return True
+
+    async def _scheduled_merge(self, guild_id: int, dev: str):
+        claimed = await self._claim_turn(guild_id)
+        try:
+            # Loaded only after the wait: the set may have been rescheduled,
+            # renamed or deleted while this run was queued.
+            config = load_merge_config(guild_id)
+            schedule = config["sets"].get(dev, {}).get("schedule")
+            if not schedule:
+                # Unscheduled after the job was registered — clean up defensively.
+                self._unregister_schedule(guild_id, dev)
+                return
+
+            channel = self.bot.get_channel(schedule["channel_id"])
+            if channel is None:
+                try:
+                    channel = await self.bot.fetch_channel(schedule["channel_id"])
+                except discord.HTTPException:
+                    logger.warning(
+                        "Scheduled merge for guild %s set %s: channel %s unavailable",
+                        guild_id, dev, schedule["channel_id"],
+                    )
+                    return
+
+            if not claimed:
+                await channel.send(
+                    f"⏰ Scheduled merge of `{dev}` skipped — another merge was still running."
                 )
                 return
-
-        if guild_id in self._running:
-            await channel.send("⏰ Scheduled merge skipped — a merge is already running.")
-            return
-        self._running.add(guild_id)
-        try:
-            error = self._config_error(guild_id, config)
-            if error:
-                await channel.send(f"⏰ Scheduled merge skipped: {error}")
+            try:
+                repo, _ = self._resolve_target(guild_id, config, dev)
+            except MergeConfigError as e:
+                await channel.send(f"⏰ Scheduled merge of `{dev}` skipped: {e}")
                 return
-            repo = config["repo"] or repo_names(guild_id)[0]
-            logger.info("Scheduled merge starting for guild %s (repo %s)", guild_id, repo)
-            status_msg = await channel.send(f"⏰ Daily merge run started for `{repo}`…")
-            report = await self._execute(guild_id, config, repo, channel, status_msg)
-            await self._post_roundup(guild_id, repo, report, channel)
+            logger.info(
+                "Scheduled merge starting for guild %s (repo %s, set %s)", guild_id, repo, dev
+            )
+            status_msg = await channel.send(f"⏰ Daily merge run started for `{repo}` → `{dev}`…")
+            report = await self._execute(guild_id, config, repo, dev, channel, status_msg)
+            await self._post_roundup(guild_id, repo, dev, report, channel)
         except Exception:
-            logger.exception("Scheduled merge failed for guild %s", guild_id)
+            logger.exception("Scheduled merge failed for guild %s set %s", guild_id, dev)
         finally:
-            self._running.discard(guild_id)
+            if claimed:
+                self._running.discard(guild_id)
 
     # ---------------------------------------------------------------- round-up
 
@@ -125,10 +177,11 @@ class MergeCog(commands.Cog):
         self,
         guild_id: int,
         repo: str,
+        dev: str,
         report: MergeReport,
         channel: discord.abc.Messageable,
     ):
-        """After a scheduled run: post the tagged-changes digest, if any.
+        """After a scheduled run: post the set's tagged-changes digest, if any.
 
         The baseline advances only when a round-up actually posts, so
         commits land in exactly one report even across manual merges,
@@ -137,10 +190,10 @@ class MergeCog(commands.Cog):
         if not report.ok or report.dev_head is None:
             return
         config = load_merge_config(guild_id)
-        state = config.get("roundup")
+        state = config["sets"].get(dev, {}).get("roundup")
         if not state or state.get("repo") != repo or not state.get("baseline"):
             # First run (or the repo was re-pointed): record silently.
-            self._save_baseline(guild_id, repo, report.dev_head)
+            self._save_baseline(guild_id, dev, repo, report.dev_head)
             return
         if state["baseline"] == report.dev_head:
             return
@@ -153,8 +206,8 @@ class MergeCog(commands.Cog):
             )
         except GitError:
             # Baseline vanished from history (force-pushed remote) — start over.
-            logger.warning("Round-up baseline invalid for guild %s; resetting", guild_id)
-            self._save_baseline(guild_id, repo, report.dev_head)
+            logger.warning("Round-up baseline invalid for guild %s set %s; resetting", guild_id, dev)
+            self._save_baseline(guild_id, dev, repo, report.dev_head)
             return
 
         pages = format_roundup_pages(groups, EMBED_DESC_LIMIT)
@@ -163,34 +216,37 @@ class MergeCog(commands.Cog):
 
         try:
             for embed in self._roundup_embeds(
-                "📋 Daily Round-up", pages, f"{repo} · changes since the last round-up"
+                "📋 Daily Round-up", pages, f"{repo} · {dev} · changes since the last round-up"
             ):
                 await channel.send(embed=embed)
         except discord.HTTPException:
             # Baseline stays even if some pages made it out: a duplicated
             # page tomorrow beats silently losing the rest of the report.
-            logger.exception("Failed to post round-up for guild %s", guild_id)
+            logger.exception("Failed to post round-up for guild %s set %s", guild_id, dev)
             return
-        self._save_baseline(guild_id, repo, report.dev_head)
+        self._save_baseline(guild_id, dev, repo, report.dev_head)
 
     roundup_group = app_commands.Group(
         name="roundup", description="Round-up of tagged changes on the dev branch", guild_only=True
     )
 
     @roundup_group.command(name="show", description="Preview the pending round-up (only you see it)")
+    @app_commands.describe(dev=DEV_OPTION)
     @require_permissions()
-    async def roundup_show(self, interaction: discord.Interaction):
-        await self._roundup_command(interaction, "show")
+    async def roundup_show(self, interaction: discord.Interaction, dev: str | None = None):
+        await self._roundup_command(interaction, "show", dev)
 
     @roundup_group.command(name="post", description="Post the pending round-up here for everyone, starting a fresh period")
+    @app_commands.describe(dev=DEV_OPTION)
     @require_permissions()
-    async def roundup_post(self, interaction: discord.Interaction):
-        await self._roundup_command(interaction, "post")
+    async def roundup_post(self, interaction: discord.Interaction, dev: str | None = None):
+        await self._roundup_command(interaction, "post", dev)
 
     @roundup_group.command(name="skip", description="Move the round-up baseline to the current dev head without posting")
+    @app_commands.describe(dev=DEV_OPTION)
     @require_permissions()
-    async def roundup_skip(self, interaction: discord.Interaction):
-        await self._roundup_command(interaction, "skip")
+    async def roundup_skip(self, interaction: discord.Interaction, dev: str | None = None):
+        await self._roundup_command(interaction, "skip", dev)
 
     @staticmethod
     def _roundup_embeds(title: str, pages: list[str], footer: str) -> list[discord.Embed]:
@@ -206,14 +262,16 @@ class MergeCog(commands.Cog):
             embeds.append(embed)
         return embeds
 
-    def _save_baseline(self, guild_id: int, repo: str, tip: str):
+    def _save_baseline(self, guild_id: int, dev: str, repo: str, tip: str):
         # Reload instead of reusing the caller's config: a /mergeconfig edit
         # made in the meantime must not be clobbered by this save.
         config = load_merge_config(guild_id)
-        config["roundup"] = {"repo": repo, "baseline": tip}
+        if dev not in config["sets"]:
+            return  # the set was deleted or renamed mid-run — nothing to track
+        config["sets"][dev]["roundup"] = {"repo": repo, "baseline": tip}
         save_merge_config(guild_id, config)
 
-    async def _roundup_command(self, interaction: discord.Interaction, mode: str):
+    async def _roundup_command(self, interaction: discord.Interaction, mode: str, requested: str | None):
         guild_id = interaction.guild_id
         if guild_id in self._running:
             await interaction.response.send_message(
@@ -223,12 +281,12 @@ class MergeCog(commands.Cog):
         self._running.add(guild_id)
         try:
             config = load_merge_config(guild_id)
-            error = self._config_error(guild_id, config)
-            if error:
-                await interaction.response.send_message(error, ephemeral=True)
+            try:
+                repo, dev = self._resolve_target(guild_id, config, requested)
+            except MergeConfigError as e:
+                await interaction.response.send_message(str(e), ephemeral=True)
                 return
-            repo = config["repo"] or repo_names(guild_id)[0]
-            state = config.get("roundup")
+            state = config["sets"][dev]["roundup"]
             has_baseline = bool(state and state.get("repo") == repo and state.get("baseline"))
             if not has_baseline and mode != "skip":
                 await interaction.response.send_message(
@@ -253,12 +311,12 @@ class MergeCog(commands.Cog):
                 await git("fetch", "--prune", "origin", cwd=workspace, env=env)
                 rc, out, _ = await git(
                     "rev-parse", "--verify", "--quiet",
-                    f"refs/remotes/origin/{config['dev_branch']}",
+                    f"refs/remotes/origin/{dev}",
                     cwd=workspace, env=env, check=False,
                 )
                 if rc != 0:
                     await interaction.followup.send(
-                        f"Development branch `{config['dev_branch']}` was not found on the remote.",
+                        f"Development branch `{dev}` was not found on the remote.",
                         ephemeral=True,
                     )
                     return
@@ -266,7 +324,7 @@ class MergeCog(commands.Cog):
 
                 if mode == "skip":
                     await self._roundup_skip_body(
-                        interaction, guild_id, repo, config, state, has_baseline, workspace, env, tip
+                        interaction, guild_id, repo, dev, state, has_baseline, workspace, env, tip
                     )
                     return
 
@@ -280,7 +338,7 @@ class MergeCog(commands.Cog):
                 if not pages:
                     pages = ["No tagged changes since the last round-up."]
                 for embed in self._roundup_embeds(
-                    "📋 Round-up preview", pages, f"{repo} · posts with the next daily merge"
+                    "📋 Round-up preview", pages, f"{repo} · {dev} · posts with the next daily merge"
                 ):
                     await interaction.followup.send(embed=embed, ephemeral=True)
                 return
@@ -293,18 +351,18 @@ class MergeCog(commands.Cog):
                 return
             try:
                 for embed in self._roundup_embeds(
-                    "📋 Round-up", pages, f"{repo} · changes since the last round-up"
+                    "📋 Round-up", pages, f"{repo} · {dev} · changes since the last round-up"
                 ):
                     await interaction.channel.send(embed=embed)
             except discord.HTTPException:
                 # Baseline stays even if some pages made it out: a duplicated
                 # page next time beats silently losing the rest of the report.
-                logger.exception("Failed to post round-up for guild %s", guild_id)
+                logger.exception("Failed to post round-up for guild %s set %s", guild_id, dev)
                 await interaction.followup.send(
                     "Could not post the full round-up in this channel.", ephemeral=True
                 )
                 return
-            self._save_baseline(guild_id, repo, tip)
+            self._save_baseline(guild_id, dev, repo, tip)
             await interaction.followup.send(
                 "Round-up posted — the next one covers changes from now on.", ephemeral=True
             )
@@ -316,7 +374,7 @@ class MergeCog(commands.Cog):
         interaction: discord.Interaction,
         guild_id: int,
         repo: str,
-        config: dict,
+        dev: str,
         state: dict | None,
         has_baseline: bool,
         workspace,
@@ -324,10 +382,10 @@ class MergeCog(commands.Cog):
         tip: str,
     ):
         if not has_baseline:
-            self._save_baseline(guild_id, repo, tip)
+            self._save_baseline(guild_id, dev, repo, tip)
             await interaction.followup.send(
                 "Round-up baseline started at the current "
-                f"`{config['dev_branch']}` head — the next round-up covers changes from now on.",
+                f"`{dev}` head — the next round-up covers changes from now on.",
                 ephemeral=True,
             )
             return
@@ -344,9 +402,9 @@ class MergeCog(commands.Cog):
             note = f"**{skipped}** tagged entr{'y' if skipped == 1 else 'ies'} skipped."
         except GitError:
             note = "the old baseline was missing from history, skipped entries could not be counted."
-        self._save_baseline(guild_id, repo, tip)
+        self._save_baseline(guild_id, dev, repo, tip)
         await interaction.followup.send(
-            f"Baseline moved to the current `{config['dev_branch']}` head — {note}", ephemeral=True
+            f"Baseline moved to the current `{dev}` head — {note}", ephemeral=True
         )
 
     # ------------------------------------------------------------------ /merge
@@ -355,9 +413,10 @@ class MergeCog(commands.Cog):
         name="merge",
         description="Merge everyone's branches into the dev branch and sync them all back up",
     )
+    @app_commands.describe(dev="Dev branch of the merge set to run (default set if omitted)")
     @app_commands.guild_only()
     @require_permissions()
-    async def merge(self, interaction: discord.Interaction):
+    async def merge(self, interaction: discord.Interaction, dev: str | None = None):
         guild_id = interaction.guild_id
         if guild_id in self._running:
             await interaction.response.send_message(
@@ -367,41 +426,40 @@ class MergeCog(commands.Cog):
             return
         self._running.add(guild_id)
         try:
-            await self._run_merge(interaction, guild_id)
+            await self._run_merge(interaction, guild_id, dev)
         finally:
             self._running.discard(guild_id)
 
-    async def _run_merge(self, interaction: discord.Interaction, guild_id: int):
+    async def _run_merge(self, interaction: discord.Interaction, guild_id: int, requested: str | None):
         age = (discord.utils.utcnow() - interaction.created_at).total_seconds()
         logger.info("/merge invoked by %s; interaction age at handler entry: %.2fs",
                     interaction.user, age)
         config = load_merge_config(guild_id)
-        error = self._config_error(guild_id, config)
-        if error:
-            await interaction.response.send_message(error, ephemeral=True)
+        try:
+            repo, dev = self._resolve_target(guild_id, config, requested)
+        except MergeConfigError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
             return
 
-        repo = config["repo"] or repo_names(guild_id)[0]
-
+        started = f"🧙 Merge run started for `{repo}` → `{dev}`…"
         try:
-            await interaction.response.send_message(f"🧙 Merge run started for `{repo}`…")
+            await interaction.response.send_message(started)
             status_msg = await interaction.original_response()
         except discord.HTTPException:
             # Interaction token already expired (slow delivery/ack). Discord
             # shows "did not respond", but the merge itself must still run —
             # fall back to plain channel messages for progress and results.
             logger.warning("Interaction ack failed; falling back to channel messages")
-            status_msg = await interaction.channel.send(
-                f"🧙 Merge run started for `{repo}`…"
-            )
+            status_msg = await interaction.channel.send(started)
 
-        await self._execute(guild_id, config, repo, interaction.channel, status_msg)
+        await self._execute(guild_id, config, repo, dev, interaction.channel, status_msg)
 
     async def _execute(
         self,
         guild_id: int,
         config: dict,
         repo: str,
+        dev: str,
         channel: discord.abc.Messageable,
         status_msg: discord.Message,
     ) -> MergeReport:
@@ -421,7 +479,7 @@ class MergeCog(commands.Cog):
             except discord.HTTPException:
                 pass
 
-        report = await engine.run(config["dev_branch"], config["branches"], progress)
+        report = await engine.run(dev, config["sets"][dev]["branches"], progress)
 
         content, embed = self._build_report_message(config, repo, report)
         await self._deliver_report(channel, status_msg, content, embed)
@@ -484,51 +542,117 @@ class MergeCog(commands.Cog):
         save_merge_config(interaction.guild_id, config)
         await interaction.response.send_message(f"/merge now operates on `{name_upper}`.", ephemeral=True)
 
-    @config_group.command(name="dev", description="Set the shared development branch")
-    @app_commands.describe(branch="Branch everyone's work is merged into (e.g. develop)")
+    @config_group.command(name="create", description="Create a merge set for another shared dev branch")
+    @app_commands.describe(dev_branch="Branch this set's user branches are merged into (e.g. patch-development)")
     @require_permissions()
-    async def config_dev(self, interaction: discord.Interaction, branch: str):
-        if not _valid_branch(branch):
+    async def config_create(self, interaction: discord.Interaction, dev_branch: str):
+        if not _valid_branch(dev_branch):
             await interaction.response.send_message("That doesn't look like a valid branch name.", ephemeral=True)
             return
         config = load_merge_config(interaction.guild_id)
-        config["dev_branch"] = branch
-        if branch in config["branches"]:
-            config["branches"].remove(branch)
+        try:
+            create_set(config, dev_branch)
+        except MergeConfigError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
         save_merge_config(interaction.guild_id, config)
-        await interaction.response.send_message(f"Development branch set to `{branch}`.", ephemeral=True)
-
-    @config_group.command(name="add", description="Add a team member's branch to the merge list")
-    @app_commands.describe(branch="Branch name to include in /merge")
-    @require_permissions()
-    async def config_add(self, interaction: discord.Interaction, branch: str):
-        if not _valid_branch(branch):
-            await interaction.response.send_message("That doesn't look like a valid branch name.", ephemeral=True)
-            return
-        config = load_merge_config(interaction.guild_id)
-        if branch == config["dev_branch"]:
-            await interaction.response.send_message(
-                f"`{branch}` is the development branch — it can't also be a user branch.", ephemeral=True
+        if config["default"] == dev_branch:
+            note = "It is the default set, so a plain `/merge` runs it. Add its user branches with `/mergeconfig add`."
+        else:
+            note = (
+                f"Add its user branches with `/mergeconfig add` (pick `dev:{dev_branch}`), "
+                f"then run it with `/merge dev:{dev_branch}`."
             )
-            return
-        if branch in config["branches"]:
-            await interaction.response.send_message(f"`{branch}` is already in the merge list.", ephemeral=True)
-            return
-        config["branches"].append(branch)
-        save_merge_config(interaction.guild_id, config)
-        await interaction.response.send_message(f"Added `{branch}` to the merge list.", ephemeral=True)
+        await interaction.response.send_message(f"Created the `{dev_branch}` merge set. {note}", ephemeral=True)
 
-    @config_group.command(name="remove", description="Remove a branch from the merge list")
-    @app_commands.describe(branch="Branch name to remove")
+    @config_group.command(name="rename", description="Change a merge set's dev branch, keeping its user branches and schedule")
+    @app_commands.describe(dev="Current dev branch of the set", new_branch="Dev branch the set should use from now on")
     @require_permissions()
-    async def config_remove(self, interaction: discord.Interaction, branch: str):
-        config = load_merge_config(interaction.guild_id)
-        if branch not in config["branches"]:
-            await interaction.response.send_message(f"`{branch}` is not in the merge list.", ephemeral=True)
+    async def config_rename(self, interaction: discord.Interaction, dev: str, new_branch: str):
+        if not _valid_branch(new_branch):
+            await interaction.response.send_message("That doesn't look like a valid branch name.", ephemeral=True)
             return
-        config["branches"].remove(branch)
+        config = load_merge_config(interaction.guild_id)
+        try:
+            rename_set(config, dev, new_branch)
+        except MergeConfigError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
         save_merge_config(interaction.guild_id, config)
-        await interaction.response.send_message(f"Removed `{branch}` from the merge list.", ephemeral=True)
+        # The schedule job is keyed by dev branch, so it has to move too.
+        self._unregister_schedule(interaction.guild_id, dev)
+        schedule = config["sets"][new_branch]["schedule"]
+        if schedule:
+            self._register_schedule(interaction.guild_id, new_branch, schedule)
+        await interaction.response.send_message(
+            f"The `{dev}` merge set now uses `{new_branch}` as its dev branch.", ephemeral=True
+        )
+
+    @config_group.command(name="delete", description="Delete a merge set (branches on the remote are not touched)")
+    @app_commands.describe(dev="Dev branch of the set to delete")
+    @require_permissions()
+    async def config_delete(self, interaction: discord.Interaction, dev: str):
+        config = load_merge_config(interaction.guild_id)
+        try:
+            removed = delete_set(config, dev)
+        except MergeConfigError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+        save_merge_config(interaction.guild_id, config)
+        self._unregister_schedule(interaction.guild_id, dev)
+        count = len(removed["branches"])
+        note = f"{count} user branch{'es' if count != 1 else ''} dropped from the config"
+        if removed["schedule"]:
+            note += ", daily merge turned off"
+        await interaction.response.send_message(
+            f"Deleted the `{dev}` merge set — {note}. Nothing was changed on the remote.", ephemeral=True
+        )
+
+    @config_group.command(name="default", description="Pick the merge set used when a command doesn't name one")
+    @app_commands.describe(dev="Dev branch of the set to make the default")
+    @require_permissions()
+    async def config_default(self, interaction: discord.Interaction, dev: str):
+        config = load_merge_config(interaction.guild_id)
+        try:
+            set_default(config, dev)
+        except MergeConfigError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+        save_merge_config(interaction.guild_id, config)
+        await interaction.response.send_message(
+            f"`{dev}` is now the default set — a plain `/merge` runs it.", ephemeral=True
+        )
+
+    @config_group.command(name="add", description="Add a team member's branch to a merge set")
+    @app_commands.describe(branch="Branch name to include in /merge", dev=DEV_OPTION)
+    @require_permissions()
+    async def config_add(self, interaction: discord.Interaction, branch: str, dev: str | None = None):
+        if not _valid_branch(branch):
+            await interaction.response.send_message("That doesn't look like a valid branch name.", ephemeral=True)
+            return
+        config = load_merge_config(interaction.guild_id)
+        try:
+            target = resolve_set(config, dev)
+            add_branch(config, target, branch)
+        except MergeConfigError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+        save_merge_config(interaction.guild_id, config)
+        await interaction.response.send_message(f"Added `{branch}` to the `{target}` merge list.", ephemeral=True)
+
+    @config_group.command(name="remove", description="Remove a branch from a merge set")
+    @app_commands.describe(branch="Branch name to remove", dev=DEV_OPTION)
+    @require_permissions()
+    async def config_remove(self, interaction: discord.Interaction, branch: str, dev: str | None = None):
+        config = load_merge_config(interaction.guild_id)
+        try:
+            target = resolve_set(config, dev)
+            remove_branch(config, target, branch)
+        except MergeConfigError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+        save_merge_config(interaction.guild_id, config)
+        await interaction.response.send_message(f"Removed `{branch}` from the `{target}` merge list.", ephemeral=True)
 
     @config_group.command(name="ping", description="Who gets pinged when a merge conflict needs resolving")
     @app_commands.describe(user="Team member to ping on conflicts")
@@ -539,14 +663,19 @@ class MergeCog(commands.Cog):
         save_merge_config(interaction.guild_id, config)
         await interaction.response.send_message(f"{user.mention} will be pinged on merge conflicts.", ephemeral=True)
 
-    @config_group.command(name="schedule", description="Run the merge automatically every day at a set time")
+    @config_group.command(name="schedule", description="Run a merge set automatically every day at a set time")
     @app_commands.describe(
         time="24-hour time in the bot host's timezone, e.g. 03:30",
         channel="Channel to post the merge results in",
+        dev=DEV_OPTION,
     )
     @require_permissions()
     async def config_schedule(
-        self, interaction: discord.Interaction, time: str, channel: discord.TextChannel
+        self,
+        interaction: discord.Interaction,
+        time: str,
+        channel: discord.TextChannel,
+        dev: str | None = None,
     ):
         match = TIME_PATTERN.match(time.strip())
         if not match:
@@ -556,25 +685,41 @@ class MergeCog(commands.Cog):
             return
         normalized = f"{int(match[1]):02d}:{int(match[2]):02d}"
         config = load_merge_config(interaction.guild_id)
-        config["schedule"] = {"time": normalized, "channel_id": channel.id}
+        try:
+            target = resolve_set(config, dev)
+        except MergeConfigError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+        schedule = {"time": normalized, "channel_id": channel.id}
+        config["sets"][target]["schedule"] = schedule
         save_merge_config(interaction.guild_id, config)
-        self._register_schedule(interaction.guild_id, config["schedule"])
+        self._register_schedule(interaction.guild_id, target, schedule)
         await interaction.response.send_message(
-            f"Daily merge scheduled for `{normalized}` (bot-host time) in {channel.mention}.",
+            f"Daily merge of `{target}` scheduled for `{normalized}` (bot-host time) in {channel.mention}.",
             ephemeral=True,
         )
 
-    @config_group.command(name="unschedule", description="Turn off the daily automatic merge")
+    @config_group.command(name="unschedule", description="Turn off a merge set's daily automatic merge")
+    @app_commands.describe(dev=DEV_OPTION)
     @require_permissions()
-    async def config_unschedule(self, interaction: discord.Interaction):
+    async def config_unschedule(self, interaction: discord.Interaction, dev: str | None = None):
         config = load_merge_config(interaction.guild_id)
-        if not config["schedule"]:
-            await interaction.response.send_message("No daily merge is scheduled.", ephemeral=True)
+        try:
+            target = resolve_set(config, dev)
+        except MergeConfigError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
             return
-        config["schedule"] = None
+        if not config["sets"][target]["schedule"]:
+            await interaction.response.send_message(
+                f"No daily merge is scheduled for `{target}`.", ephemeral=True
+            )
+            return
+        config["sets"][target]["schedule"] = None
         save_merge_config(interaction.guild_id, config)
-        self._unregister_schedule(interaction.guild_id)
-        await interaction.response.send_message("Daily automatic merge turned off.", ephemeral=True)
+        self._unregister_schedule(interaction.guild_id, target)
+        await interaction.response.send_message(
+            f"Daily automatic merge of `{target}` turned off.", ephemeral=True
+        )
 
     @config_group.command(name="show", description="Show the current merge configuration")
     @require_permissions()
@@ -585,21 +730,30 @@ class MergeCog(commands.Cog):
         def fmt(value):
             return f"`{value}`" if value else "_not set_"
 
-        branch_list = ", ".join(f"`{b}`" for b in config["branches"]) or "_none_"
         ping_str = f"<@{ping_id}>" if ping_id else "_not set_"
-        schedule = config["schedule"]
-        schedule_str = (
-            f"daily at `{schedule['time']}` (bot-host time) in <#{schedule['channel_id']}>"
-            if schedule else "_off_"
-        )
         lines = [
             f"**Repo:** {fmt(config['repo'])}",
-            f"**Dev branch:** {fmt(config['dev_branch'])}",
-            f"**User branches:** {branch_list}",
             f"**Conflict ping:** {ping_str}",
-            f"**Daily merge:** {schedule_str}",
         ]
-        embed = discord.Embed(title="Merge configuration", description="\n".join(lines), color=0x5865F2)
+        if not config["sets"]:
+            lines += ["", "_No merge sets yet — create one with `/mergeconfig create`._"]
+        for dev, merge_set in config["sets"].items():
+            branch_list = ", ".join(f"`{b}`" for b in merge_set["branches"]) or "_none_"
+            schedule = merge_set["schedule"]
+            schedule_str = (
+                f"daily at `{schedule['time']}` (bot-host time) in <#{schedule['channel_id']}>"
+                if schedule else "_off_"
+            )
+            lines += [
+                "",
+                f"**Dev branch:** `{dev}`" + (" · default set" if dev == config["default"] else ""),
+                f"**User branches:** {branch_list}",
+                f"**Daily merge:** {schedule_str}",
+            ]
+        description = "\n".join(lines)
+        if len(description) > EMBED_DESC_LIMIT:
+            description = description[: EMBED_DESC_LIMIT - 1] + "…"
+        embed = discord.Embed(title="Merge configuration", description=description, color=0x5865F2)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ------------------------------------------------------------ autocomplete
@@ -616,21 +770,48 @@ class MergeCog(commands.Cog):
             if current.upper() in n
         ][:25]
 
-    @config_remove.autocomplete("branch")
-    async def remove_autocomplete(self, interaction: discord.Interaction, current: str):
-        if check_permissions(interaction, "mergeconfig remove"):
+    @merge.autocomplete("dev")
+    @roundup_show.autocomplete("dev")
+    @roundup_post.autocomplete("dev")
+    @roundup_skip.autocomplete("dev")
+    @config_rename.autocomplete("dev")
+    @config_delete.autocomplete("dev")
+    @config_default.autocomplete("dev")
+    @config_add.autocomplete("dev")
+    @config_remove.autocomplete("dev")
+    @config_schedule.autocomplete("dev")
+    @config_unschedule.autocomplete("dev")
+    async def dev_autocomplete(self, interaction: discord.Interaction, current: str):
+        """Suggest the guild's merge sets, by dev branch."""
+        if not autocomplete_allowed(interaction):
             return []
         config = load_merge_config(interaction.guild_id)
         return [
+            app_commands.Choice(name=f"{d} (default)" if d == config["default"] else d, value=d)
+            for d in config["sets"]
+            if current.lower() in d.lower()
+        ][:25]
+
+    @config_remove.autocomplete("branch")
+    async def remove_autocomplete(self, interaction: discord.Interaction, current: str):
+        if not autocomplete_allowed(interaction):
+            return []
+        config = load_merge_config(interaction.guild_id)
+        # Follow the set already picked in `dev`, else the default set.
+        dev = interaction.namespace.dev or config["default"]
+        branches = config["sets"].get(dev, {}).get("branches", [])
+        return [
             app_commands.Choice(name=b, value=b)
-            for b in config["branches"]
+            for b in branches
             if current.lower() in b.lower()
         ][:25]
 
     @config_add.autocomplete("branch")
-    async def add_autocomplete(self, interaction: discord.Interaction, current: str):
-        """Suggest remote branches from the cloned workspace, if it exists."""
-        if check_permissions(interaction, "mergeconfig add"):
+    @config_create.autocomplete("dev_branch")
+    @config_rename.autocomplete("new_branch")
+    async def free_branch_autocomplete(self, interaction: discord.Interaction, current: str):
+        """Suggest remote branches no merge set uses yet, from the cloned workspace if it exists."""
+        if not autocomplete_allowed(interaction):
             return []
         config = load_merge_config(interaction.guild_id)
         repo = config["repo"]
@@ -646,28 +827,31 @@ class MergeCog(commands.Cog):
             )
         except Exception:
             return []
-        taken = set(config["branches"]) | {config["dev_branch"], "HEAD"}
         return [
             app_commands.Choice(name=b, value=b)
             for b in out.strip().splitlines()
-            if b and b not in taken and current.lower() in b.lower()
+            if b and b != "HEAD" and branch_owner(config, b) is None and current.lower() in b.lower()
         ][:25]
 
     # ----------------------------------------------------------------- helpers
 
-    def _config_error(self, guild_id: int, config: dict) -> str | None:
+    def _resolve_target(self, guild_id: int, config: dict, requested: str | None) -> tuple[str, str]:
+        """(repo, dev branch) a run should act on; MergeConfigError names the fix otherwise."""
         names = repo_names(guild_id)
         if not names:
-            return "No repo registered yet — add one with `/repo add`."
+            raise MergeConfigError("No repo registered yet — add one with `/repo add`.")
         if config["repo"] and config["repo"] not in names:
-            return f"Configured repo `{config['repo']}` is no longer registered — fix it with `/mergeconfig repo`."
+            raise MergeConfigError(
+                f"Configured repo `{config['repo']}` is no longer registered — fix it with `/mergeconfig repo`."
+            )
         if not config["repo"] and len(names) > 1:
-            return "Several repos are registered — pick one with `/mergeconfig repo`."
-        if not config["dev_branch"]:
-            return "No development branch set — set it with `/mergeconfig dev`."
-        if not config["branches"]:
-            return "No user branches configured — add them with `/mergeconfig add`."
-        return None
+            raise MergeConfigError("Several repos are registered — pick one with `/mergeconfig repo`.")
+        dev = resolve_set(config, requested)
+        if not config["sets"][dev]["branches"]:
+            raise MergeConfigError(
+                f"No user branches configured for `{dev}` — add them with `/mergeconfig add`."
+            )
+        return config["repo"] or names[0], dev
 
     def _build_report_message(
         self, config: dict, repo: str, report: MergeReport
@@ -717,6 +901,8 @@ class MergeCog(commands.Cog):
         # was pushed), so the resolver must replay them before the conflicting
         # merge or the conflict won't reproduce / will bounce to the next run.
         prior = [r.branch for r in report.results if r.status == "merged"]
+        # Only the default set runs without being named.
+        set_arg = "" if report.dev_branch == config["default"] else f" dev:{report.dev_branch}"
 
         def build(max_files: int) -> str:
             shown = "\n".join(f"• `{f}`" for f in files[:max_files])
@@ -737,7 +923,7 @@ class MergeCog(commands.Cog):
                 "The run was stopped and **nothing was pushed** — all branches are untouched.\n\n"
                 f"**Conflicting files:**\n{shown}\n\n"
                 f"**To resolve, in your own clone:**\n```sh\n{instructions}\n```\n"
-                "Then run `/merge` again — and `/roundup post` if the team "
+                f"Then run `/merge{set_arg}` again — and `/roundup post{set_arg}` if the team "
                 "shouldn't wait for the daily round-up."
             )
 

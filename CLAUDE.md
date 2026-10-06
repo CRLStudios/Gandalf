@@ -17,6 +17,7 @@ Standalone scripts in `tests/`, no pytest, no Discord connection:
 
 ```
 venv/bin/python tests/local_merge_tests.py
+venv/bin/python tests/local_mergeconfig_tests.py
 venv/bin/python tests/local_retry_tests.py
 ```
 

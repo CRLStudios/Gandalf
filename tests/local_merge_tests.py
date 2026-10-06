@@ -79,11 +79,11 @@ def setup_repos(base: Path) -> tuple[Path, Path]:
     return origin, clone
 
 
-def run_engine(engine: MergeEngine, branches: list[str], progress=None):
+def run_engine(engine: MergeEngine, branches: list[str], progress=None, dev: str = "develop"):
     async def _run():
         if progress:
-            return await engine.run("develop", branches, progress)
-        return await engine.run("develop", branches)
+            return await engine.run(dev, branches, progress)
+        return await engine.run(dev, branches)
 
     return asyncio.run(_run())
 
@@ -257,6 +257,62 @@ def main():
     check("workspace re-pointed", sh("git", "-C", str(ws), "remote", "get-url", "origin") == str(origin2))
     check("new origin advanced", origin_ref(origin2, "develop") == origin_ref(origin2, "alice"))
     check("old origin untouched", origin_ref(origin, "develop") == old_dev)
+
+    # --- Test 11: two merge sets share one workspace ------------------------
+    # A second dev branch (patch-development) with its own user branches runs
+    # back to back with the develop set in the same clone, like /merge dev:...
+    print("\nTest 11: two merge sets in one workspace")
+    sets_base = base / "sets"
+    sets_base.mkdir()
+    origin_s, clone_s = setup_repos(sets_base)
+    sh("git", "-C", str(clone_s), "checkout", "-b", "patch-development", "develop")
+    sh("git", "-C", str(clone_s), "push", "origin", "patch-development")
+    for branch in ("alice-patch", "bob-patch"):
+        sh("git", "-C", str(clone_s), "checkout", "-b", branch, "patch-development")
+        sh("git", "-C", str(clone_s), "push", "origin", branch)
+    ws_s = sets_base / "workspace"
+    engine_s = MergeEngine(ws_s, str(origin_s))
+    dev_set, patch_set = ["alice", "bob"], ["alice-patch", "bob-patch"]
+
+    write_and_push(clone_s, "alice", "feature.txt", "new feature\n", "alice feature")
+    write_and_push(clone_s, "alice-patch", "hotfix.txt", "live fix\n", "alice hotfix")
+    report = run_engine(engine_s, dev_set)
+    check("develop set ok", report.ok and report.pushed, str(report.error))
+    report = run_engine(engine_s, patch_set, dev="patch-development")
+    check("patch set ok", report.ok and report.pushed, str(report.error))
+    check("patch report names its dev branch", report.dev_branch == "patch-development")
+    dev_tree = sh("git", "-C", str(origin_s), "ls-tree", "--name-only", "develop")
+    patch_tree = sh("git", "-C", str(origin_s), "ls-tree", "--name-only", "patch-development")
+    check("develop got only its own set's work",
+          "feature.txt" in dev_tree and "hotfix.txt" not in dev_tree, dev_tree)
+    check("patch-development got only its own set's work",
+          "hotfix.txt" in patch_tree and "feature.txt" not in patch_tree, patch_tree)
+    dev = origin_ref(origin_s, "develop")
+    patch = origin_ref(origin_s, "patch-development")
+    check("develop set synced to develop",
+          origin_ref(origin_s, "alice") == dev and origin_ref(origin_s, "bob") == dev)
+    check("patch set synced to patch-development",
+          origin_ref(origin_s, "alice-patch") == patch and origin_ref(origin_s, "bob-patch") == patch)
+    heads = sh("git", "-C", str(ws_s), "for-each-ref", "--format=%(refname:short)", "refs/heads")
+    check("workspace holds only the last run's dev branch", heads == "patch-development", heads)
+
+    # A conflict in the patch set must not touch, or block, the develop set.
+    write_and_push(clone_s, "alice-patch", "shared.txt", "line1\nALICE FIX\nline3\n", "alice patch edit")
+    write_and_push(clone_s, "bob-patch", "shared.txt", "line1\nBOB FIX\nline3\n", "bob patch edit")
+    write_and_push(clone_s, "bob", "level.txt", "new level\n", "bob level")
+    report = run_engine(engine_s, patch_set, dev="patch-development")
+    check("patch set conflicts", report.conflict is not None and report.conflict.branch == "bob-patch",
+          str(report.conflict))
+    check("patch-development untouched", origin_ref(origin_s, "patch-development") == patch)
+    check("develop untouched by patch conflict", origin_ref(origin_s, "develop") == dev)
+    report = run_engine(engine_s, dev_set)
+    statuses = {r.branch: r.status for r in report.results}
+    check("develop set still runs clean", report.ok and statuses.get("bob") == "merged",
+          f"{report.error} {statuses}")
+    dev_tree = sh("git", "-C", str(origin_s), "ls-tree", "--name-only", "develop")
+    check("develop has no patch work after the conflict",
+          "level.txt" in dev_tree and "hotfix.txt" not in dev_tree, dev_tree)
+    check("patch-development still untouched", origin_ref(origin_s, "patch-development") == patch)
 
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
