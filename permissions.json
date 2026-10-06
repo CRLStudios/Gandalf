@@ -1,10 +1,10 @@
 {
   "admin_user_id": "323319762966937613",
-  "allowed_guilds": [988122446383153193],
+  "allowed_guilds": [440662090785619977],
   "commands": {
     "hello": {
-      "roles": ["Gandalf User"],
-      "channels": ["bot"]
+      "roles": ["team"],
+      "channels": ["code"]
     },
     "run": {
       "roles": [],
@@ -19,9 +19,12 @@
       "channels": []
     },
     "merge": {
-      "roles": ["Gandalf User"],
+      "roles": ["team"],
       "channels": ["code"]
     },
+    "roundup show": { "roles": ["team"], "channels": [] },
+    "roundup post": { "roles": [], "channels": [] },
+    "roundup skip": { "roles": [], "channels": [] },
     "repo add": { "roles": [], "channels": [] },
     "repo remove": { "roles": [], "channels": [] },
     "mergeconfig repo": { "roles": [], "channels": [] },
@@ -45,7 +48,7 @@
     }
   },
   "default": {
-    "roles": ["Gandalf User"],
+    "roles": ["team"],
     "channels": []
   }
 }
