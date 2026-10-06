@@ -66,6 +66,7 @@ def main():
     print("\nTest 1: guild with no config")
     config = load_merge_config(GUILD)
     check("no sets", config["sets"] == {} and config["default"] is None, str(config))
+    check("no release branch", config["release_branch"] is None, str(config))
     check("resolve refuses, naming the fix",
           "/mergeconfig create" in (refused(resolve_set, config, None) or ""))
     create_set(config, "develop")
@@ -87,13 +88,16 @@ def main():
     check("schedule carried", config["sets"]["develop"]["schedule"] == schedule)
     check("round-up baseline carried", config["sets"]["develop"]["roundup"] == roundup)
     check("legacy keys gone", "dev_branch" not in config and "branches" not in config, str(config))
+    check("file without a release branch loads as unset", config["release_branch"] is None, str(config))
 
     # --- Test 3: save / load round trip in the new shape --------------------
     print("\nTest 3: round trip")
+    config["release_branch"] = "main"
     save_merge_config(GUILD, config)
     on_disk = json.loads((mc.MERGECONFIGS_DIR / f"{GUILD}.json").read_text())
     check("saved in the new shape", "sets" in on_disk and "dev_branch" not in on_disk, str(on_disk))
     check("reload is identical", load_merge_config(GUILD) == config)
+    check("release branch survives the round trip", load_merge_config(GUILD)["release_branch"] == "main")
     check("guild listed", all_guild_ids() == [GUILD], str(all_guild_ids()))
 
     # --- Test 4: legacy file that never had a dev branch --------------------

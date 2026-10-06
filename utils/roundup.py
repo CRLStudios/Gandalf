@@ -49,17 +49,18 @@ def parse_message(message: str) -> list[tuple[str, str]]:
 
 
 async def collect_roundup(
-    workspace: Path, env: dict[str, str], base: str, tip: str
+    workspace: Path, env: dict[str, str], base: str | None, tip: str
 ) -> dict[str, list[str]]:
     """Tagged lines from base..tip, grouped by lower-cased tag, oldest first.
 
+    A base of None covers the whole history up to tip.
     Merge commits and commits authored by the bot are skipped.
     Raises GitError if base is not in the workspace's history (e.g. a
     force-pushed remote) — callers treat that as "no baseline yet".
     """
     _, out, _ = await git(
         "log", "--reverse", "--no-merges", "--format=%ae%x1f%B%x1e",
-        f"{base}..{tip}", cwd=workspace, env=env,
+        tip if base is None else f"{base}..{tip}", cwd=workspace, env=env,
     )
     groups: dict[str, list[str]] = {}
     for record in out.split("\x1e"):

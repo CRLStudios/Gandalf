@@ -25,6 +25,14 @@ from utils.merge_config import (
     set_default,
 )
 from utils.merge_engine import BranchResult, MergeEngine, MergeReport
+from utils.patchnotes import (
+    PatchNotesError,
+    PatchRange,
+    fetch_refs,
+    normalize_version,
+    resolve_range,
+    version_tags,
+)
 from utils.permissions import (
     autocomplete_allowed,
     check_permissions,
@@ -407,6 +415,139 @@ class MergeCog(commands.Cog):
             f"Baseline moved to the current `{dev}` head — {note}", ephemeral=True
         )
 
+    # ------------------------------------------------------------- /patchnotes
+
+    @app_commands.command(
+        name="patchnotes",
+        description="Tagged changes that went into a version, since the version before it",
+    )
+    @app_commands.describe(
+        version="Version tag, e.g. v1.0.3 (default: whatever is at the head of the branch)",
+        branch="Branch to look at (default: the release branch)",
+        post="Post the notes here for everyone instead of showing them only to you",
+    )
+    @app_commands.guild_only()
+    @require_permissions()
+    async def patchnotes(
+        self,
+        interaction: discord.Interaction,
+        version: str | None = None,
+        branch: str | None = None,
+        post: bool = False,
+    ):
+        guild_id = interaction.guild_id
+        if post:
+            # Publishing has its own permissions.json entry, like /roundup post.
+            denied = check_permissions(interaction, "patchnotes post")
+            if denied:
+                await interaction.response.send_message(
+                    f"Posting patch notes for everyone is restricted — {denied} "
+                    "Leave `post` off to see them yourself.",
+                    ephemeral=True,
+                )
+                return
+        tag = None
+        if version is not None:
+            tag = normalize_version(version)
+            if tag is None:
+                await interaction.response.send_message(
+                    "A version looks like `v1.0.3` — `v`, then three numbers.", ephemeral=True
+                )
+                return
+        config = load_merge_config(guild_id)
+        branch = branch or config["release_branch"]
+        if not branch:
+            await interaction.response.send_message(
+                "No release branch set — set one with `/mergeconfig release`, or pass `branch:`.",
+                ephemeral=True,
+            )
+            return
+        if not _valid_branch(branch):
+            await interaction.response.send_message("That doesn't look like a valid branch name.", ephemeral=True)
+            return
+        try:
+            repo = self._resolve_repo(guild_id, config)
+        except MergeConfigError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+
+        # Fetching shares the workspace with merge runs, so it takes the same guard.
+        if guild_id in self._running:
+            await interaction.response.send_message(
+                "A merge is running for this server — try again in a minute.", ephemeral=True
+            )
+            return
+        self._running.add(guild_id)
+        try:
+            workspace = repo_workspace(guild_id, repo)
+            if not (workspace / ".git").exists():
+                await interaction.response.send_message(
+                    "The bot hasn't cloned this repo yet — run `/merge` first.", ephemeral=True
+                )
+                return
+
+            # The public post is sent separately via the channel, so the
+            # interaction side stays ephemeral either way.
+            await interaction.response.defer(ephemeral=True)
+            _, token = repo_credentials(guild_id, repo)
+            env = build_git_env(token)
+            try:
+                await fetch_refs(workspace, env)
+                notes = await resolve_range(workspace, env, branch, tag)
+                groups = await collect_roundup(workspace, env, notes.base, notes.tip)
+            except PatchNotesError as e:
+                await interaction.followup.send(str(e), ephemeral=True)
+                return
+            except GitError as e:
+                await interaction.followup.send(f"Could not read the repo: {e}", ephemeral=True)
+                return
+
+            title, span, empty = self._patchnotes_labels(notes)
+            footer = f"{repo} · {branch} · {span}"
+            pages = format_roundup_pages(groups, EMBED_DESC_LIMIT)
+            if not post:
+                for embed in self._roundup_embeds(title, pages or [empty], footer):
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+
+            if not pages:
+                await interaction.followup.send(f"{empty} Nothing to post.", ephemeral=True)
+                return
+            try:
+                for embed in self._roundup_embeds(title, pages, footer):
+                    await interaction.channel.send(embed=embed)
+            except discord.HTTPException:
+                logger.exception("Failed to post patch notes for guild %s", guild_id)
+                await interaction.followup.send(
+                    "Could not post the full patch notes in this channel.", ephemeral=True
+                )
+                return
+            await interaction.followup.send("Patch notes posted.", ephemeral=True)
+        finally:
+            self._running.discard(guild_id)
+
+    @staticmethod
+    def _patchnotes_labels(notes: PatchRange) -> tuple[str, str, str]:
+        """(embed title, footer span, reply when nothing is tagged) for a range."""
+        if notes.version is None:
+            return (
+                f"📝 Unreleased changes since {notes.previous}",
+                f"since {notes.previous}",
+                f"No tagged changes since `{notes.previous}`.",
+            )
+        title = f"📝 Patch notes — {notes.version}"
+        if notes.previous is None:
+            return (
+                title,
+                f"everything up to {notes.version}",
+                f"No tagged changes up to `{notes.version}`.",
+            )
+        return (
+            title,
+            f"{notes.previous} → {notes.version}",
+            f"No tagged changes between `{notes.previous}` and `{notes.version}`.",
+        )
+
     # ------------------------------------------------------------------ /merge
 
     @app_commands.command(
@@ -654,6 +795,20 @@ class MergeCog(commands.Cog):
         save_merge_config(interaction.guild_id, config)
         await interaction.response.send_message(f"Removed `{branch}` from the `{target}` merge list.", ephemeral=True)
 
+    @config_group.command(name="release", description="Pick the release branch /patchnotes looks at by default")
+    @app_commands.describe(branch="Branch your version tags (v1.0.3, …) are made on")
+    @require_permissions()
+    async def config_release(self, interaction: discord.Interaction, branch: str):
+        if not _valid_branch(branch):
+            await interaction.response.send_message("That doesn't look like a valid branch name.", ephemeral=True)
+            return
+        config = load_merge_config(interaction.guild_id)
+        config["release_branch"] = branch
+        save_merge_config(interaction.guild_id, config)
+        await interaction.response.send_message(
+            f"`/patchnotes` now looks at `{branch}` by default.", ephemeral=True
+        )
+
     @config_group.command(name="ping", description="Who gets pinged when a merge conflict needs resolving")
     @app_commands.describe(user="Team member to ping on conflicts")
     @require_permissions()
@@ -734,6 +889,7 @@ class MergeCog(commands.Cog):
         lines = [
             f"**Repo:** {fmt(config['repo'])}",
             f"**Conflict ping:** {ping_str}",
+            f"**Release branch:** {fmt(config['release_branch'])}",
         ]
         if not config["sets"]:
             lines += ["", "_No merge sets yet — create one with `/mergeconfig create`._"]
@@ -814,11 +970,59 @@ class MergeCog(commands.Cog):
         if not autocomplete_allowed(interaction):
             return []
         config = load_merge_config(interaction.guild_id)
-        repo = config["repo"]
-        if not repo:
+        return [
+            app_commands.Choice(name=b, value=b)
+            for b in await self._remote_branches(interaction.guild_id, config)
+            if branch_owner(config, b) is None and current.lower() in b.lower()
+        ][:25]
+
+    @patchnotes.autocomplete("branch")
+    @config_release.autocomplete("branch")
+    async def remote_branch_autocomplete(self, interaction: discord.Interaction, current: str):
+        """Suggest any remote branch, from the cloned workspace if it exists."""
+        if not autocomplete_allowed(interaction):
             return []
-        workspace = repo_workspace(interaction.guild_id, repo)
-        if not (workspace / ".git").exists():
+        config = load_merge_config(interaction.guild_id)
+        return [
+            app_commands.Choice(name=b, value=b)
+            for b in await self._remote_branches(interaction.guild_id, config)
+            if current.lower() in b.lower()
+        ][:25]
+
+    @patchnotes.autocomplete("version")
+    async def version_autocomplete(self, interaction: discord.Interaction, current: str):
+        """Suggest version tags on the branch already picked, else the release branch — newest first."""
+        if not autocomplete_allowed(interaction):
+            return []
+        config = load_merge_config(interaction.guild_id)
+        branch = interaction.namespace.branch or config["release_branch"]
+        workspace = self._cloned_workspace(interaction.guild_id, config)
+        if workspace is None or not branch or not _valid_branch(branch):
+            return []
+        try:
+            tags = await version_tags(
+                workspace, build_git_env(), f"refs/remotes/origin/{branch}", timeout=2
+            )
+        except Exception:
+            return []
+        wanted = current.strip().lower().lstrip("v")
+        return [app_commands.Choice(name=t, value=t) for t in tags if wanted in t][:25]
+
+    # ----------------------------------------------------------------- helpers
+
+    def _cloned_workspace(self, guild_id: int, config: dict):
+        """The workspace of the repo merge commands act on, or None if there is no clone to ask."""
+        try:
+            repo = self._resolve_repo(guild_id, config)
+        except MergeConfigError:
+            return None
+        workspace = repo_workspace(guild_id, repo)
+        return workspace if (workspace / ".git").exists() else None
+
+    async def _remote_branches(self, guild_id: int, config: dict) -> list[str]:
+        """Remote branch names as of the last fetch; [] without a clone. For autocomplete."""
+        workspace = self._cloned_workspace(guild_id, config)
+        if workspace is None:
             return []
         try:
             _, out, _ = await git(
@@ -827,16 +1031,10 @@ class MergeCog(commands.Cog):
             )
         except Exception:
             return []
-        return [
-            app_commands.Choice(name=b, value=b)
-            for b in out.strip().splitlines()
-            if b and b != "HEAD" and branch_owner(config, b) is None and current.lower() in b.lower()
-        ][:25]
+        return [b for b in out.strip().splitlines() if b and b != "HEAD"]
 
-    # ----------------------------------------------------------------- helpers
-
-    def _resolve_target(self, guild_id: int, config: dict, requested: str | None) -> tuple[str, str]:
-        """(repo, dev branch) a run should act on; MergeConfigError names the fix otherwise."""
+    def _resolve_repo(self, guild_id: int, config: dict) -> str:
+        """The repo merge commands act on; MergeConfigError names the fix otherwise."""
         names = repo_names(guild_id)
         if not names:
             raise MergeConfigError("No repo registered yet — add one with `/repo add`.")
@@ -846,12 +1044,17 @@ class MergeCog(commands.Cog):
             )
         if not config["repo"] and len(names) > 1:
             raise MergeConfigError("Several repos are registered — pick one with `/mergeconfig repo`.")
+        return config["repo"] or names[0]
+
+    def _resolve_target(self, guild_id: int, config: dict, requested: str | None) -> tuple[str, str]:
+        """(repo, dev branch) a run should act on; MergeConfigError names the fix otherwise."""
+        repo = self._resolve_repo(guild_id, config)
         dev = resolve_set(config, requested)
         if not config["sets"][dev]["branches"]:
             raise MergeConfigError(
                 f"No user branches configured for `{dev}` — add them with `/mergeconfig add`."
             )
-        return config["repo"] or names[0], dev
+        return repo, dev
 
     def _build_report_message(
         self, config: dict, repo: str, report: MergeReport

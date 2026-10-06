@@ -37,7 +37,7 @@ The bot's own clone of a registered repo. Disposable — the merge run resets it
 _Avoid_: checkout, working copy
 
 **Merge config**:
-A guild's settings for `/merge`: which repo, the conflict handler, and its merge sets.
+A guild's settings for `/merge`: which repo, the conflict handler, the release branch, and its merge sets.
 
 **Merge set**:
 One dev branch plus the user branches merged into it, with its own optional daily schedule and round-up baseline. Identified by its dev branch. A guild can have any number; they are independent — nothing flows between sets.
@@ -72,12 +72,25 @@ _Avoid_: tag (collides with git tags), label, category
 **Baseline**:
 The dev-branch commit where the last posted round-up ended; the next round-up covers everything after it. Advances when a round-up posts (scheduled or manual), or deliberately via a skip.
 
+**Version tag**:
+A git tag of the strict form `vX.Y.Z` marking a release. Every other git tag is ignored.
+_Avoid_: tag (collides with round-up tags), release tag
+
+**Release branch**:
+The branch version tags are made on; where patch notes look when no branch is named. One per guild, independent of merge sets.
+_Avoid_: main, master
+
+**Patch notes**:
+The round-up digest cut by release: the tagged commit-message lines that went into a version, from just after the previous version up to and including the version tag's commit. The previous version is the highest lower version in that version's own history. An untagged release-branch head gets the unreleased changes since its latest version. Shown on demand; has no baseline.
+_Avoid_: changelog, release notes, round-up (that one is per merge set and has a baseline)
+
 ## Invariants
 
 - Exactly one bot process, on one host. All state is files beside the code — no database. Two processes would corrupt state and break the merge guard.
 - At most one merge run in flight per guild, across all its merge sets (they share one workspace); manual and scheduled runs share the same guard. A manual run that finds it taken is rejected; a scheduled run waits its turn.
 - A branch is in at most one merge set, as its dev branch or as a user branch — never both, never two sets.
 - A merge run is all-or-nothing: no conflict has ever been pushed.
+- Patch notes are stateless: version tags on the remote are their only input, and producing them never moves a round-up baseline.
 - Permissions are re-read from disk on every check — changes apply with no restart.
 - All scheduling fires in bot-host local time.
 - Guild isolation is absolute: nothing a guild stores or runs is visible to another guild.

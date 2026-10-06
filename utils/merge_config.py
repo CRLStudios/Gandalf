@@ -1,4 +1,4 @@
-"""Per-guild merge config: one repo and conflict handler, any number of merge sets.
+"""Per-guild merge config: one repo, conflict handler and release branch, any number of merge sets.
 
 A merge set is a dev branch plus the user branches merged into it, with its
 own daily schedule and round-up baseline. Sets are keyed by their dev branch;
@@ -27,7 +27,8 @@ def _new_config() -> dict:
     return {
         "repo": None,          # repo name as registered via /repo add
         "ping_user_id": None,  # who gets pinged on conflict (falls back to admin_user_id)
-        "default": None,       # dev branch of the set used when none is named
+        "release_branch": None,  # branch /patchnotes reads version tags from by default
+        "default": None,      # dev branch of the set used when none is named
         "sets": {},            # dev branch -> merge set
     }
 
@@ -53,6 +54,7 @@ def _normalize(data: dict) -> dict:
     config = _new_config()
     config["repo"] = data.get("repo")
     config["ping_user_id"] = data.get("ping_user_id")
+    config["release_branch"] = data.get("release_branch")
     if isinstance(data.get("sets"), dict):
         for dev, merge_set in data["sets"].items():
             config["sets"][dev] = {**_new_set(), **merge_set}

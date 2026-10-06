@@ -75,10 +75,11 @@ Logs written to `bot.log`.
 | `/env remove key` | Remove a per-server env var |
 | `/env list` | Show env var keys (values are never displayed) |
 | `/merge dev?` | Merge a merge set's user branches into its dev branch, then sync them back (default set if `dev` is omitted) |
-| `/mergeconfig ...` | Configure `/merge` (repo, merge sets, user branches, conflict ping, daily schedule) |
+| `/mergeconfig ...` | Configure `/merge` (repo, merge sets, user branches, conflict ping, daily schedule, release branch) |
 | `/roundup show dev?` | Preview the pending round-up (only you see it) |
 | `/roundup post dev?` | Post the pending round-up here for everyone, starting a fresh period |
 | `/roundup skip dev?` | Move the round-up baseline to the current dev head without posting |
+| `/patchnotes version? branch? post?` | Tagged changes that went into a version, since the version before it |
 
 Shortcut commands (e.g. `/deploy`) can be added by mapping a name to a script
 in `shortcuts/global.json` or `shortcuts/<guild_id>.json`; they appear as
@@ -199,6 +200,39 @@ Reworked coyote time
   posting: everything accumulated so far is dropped from future reports
   (the reply tells you how many entries were skipped). Also works before
   the first scheduled merge, to start the round-up clock "from now".
+
+### Patch notes
+
+`/patchnotes` is the same digest cut by **release** instead of by day: the
+tagged commit lines that went into a version, since the version before it.
+A version is a git tag of the form `v1.0.3` (`v` and three numbers) on the
+release branch — set that once with `/mergeconfig release main`.
+
+```
+/patchnotes                      the version at the head of the release branch
+/patchnotes version:v1.0.2       an older version
+/patchnotes branch:patch-release another branch, just this once
+/patchnotes post:True            publish in this channel instead of showing only you
+```
+
+- If the head of the branch is tagged `v1.0.3`, the notes cover everything
+  after `v1.0.2` up to and including the `v1.0.3` commit. If the head isn't
+  tagged yet, you get the **unreleased changes** since the latest version.
+- The "version before" is the highest lower version in that version's own
+  history, so a `v1.0.4` hotfix tagged after `v1.1.0` shipped doesn't become
+  the baseline for `v1.1.1`. The first version covers the whole history up
+  to its tag.
+- Only `vX.Y.Z` tags count: `v1.0.3-rc1`, `build-42` and the like are
+  ignored. `version:` must be a tag in the history of the branch you're
+  looking at.
+- Commit lines are picked up exactly as for the round-up (`[Tag]` lines,
+  sticky tags, merge and bot commits skipped, long reports paginated).
+- Nothing is remembered between runs — the git tags are the only state, so
+  the same version always gives the same notes, and patch notes never
+  affect the round-up.
+- Anyone on the team can view patch notes privately; `post:True` has its
+  own `patchnotes post` entry in `permissions.json`, so publishing can be
+  restricted separately from viewing.
 
 ## Scripts
 
